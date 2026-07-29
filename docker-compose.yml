@@ -13,6 +13,30 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - omnispider_net
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: omnispider_celery_worker
+    restart: always
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 123
+      POSTGRES_DB: lead_gen_db
+      REDIS_URL: rediss://default:gQAAAAAAAfIEAAIgcDEyODg0MTAxYzM3OGI0Yzc1YTZlZDBmMDU1OGI3NDFjOQ@neutral-earwig-127492.upstash.io:6379
+    depends_on:
+      - postgres
+    networks:
+      - omnispider_net
 
 volumes:
   postgres_data:
+
+networks:
+  omnispider_net:
+    driver: bridge

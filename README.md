@@ -78,6 +78,15 @@ python scripts/init_db.py
 
 ---
 
+## 🐳 Docker Setup (PostgreSQL + Linux Multiprocessing Celery Worker)
+
+To run **PostgreSQL** and **Celery Workers** inside a native **Linux Docker Container** (enabling multi-core Linux `prefork` process pools with Chrome headless support):
+
+```powershell
+# Build and launch PostgreSQL and Celery Worker containers
+docker compose up --build -d
+```
+
 ## 🧪 Usage & Testing
 
 ### Step 1: Start Celery Worker (Terminal 1)
