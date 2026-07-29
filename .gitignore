@@ -1,0 +1,38 @@
+# Environment & Secret files (NEVER COMMIT OR PUSH TO GIT)
+.env
+.env.local
+.env.*.local
+*.env
+
+# Python Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Database Migrations & Alembic
+alembic/
+alembic.ini
+migrations/
+
+# Skills & Agent Artifacts
+skills/
+.agents/
+.agents/artifacts/
+.agents/scratch/
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS System Files
+.DS_Store
+Thumbs.db
