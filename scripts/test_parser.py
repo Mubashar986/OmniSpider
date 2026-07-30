@@ -52,7 +52,40 @@ def test_parser():
         print(f"   Phones:      {[p.model_dump() for p in lead.phones]}")
         print(f"   LinkedIn:    {lead.linkedin_url}")
 
-    print("\nHTML PARSER TEST COMPLETE: All DOM extraction and Pydantic schemas verified!")
+    print("\n--- Testing URL Canonicalization ---")
+    raw_urls = [
+        "https://www.AcmeInnovations.com:443/About/?utm_source=google&id=123#section",
+        "HTTP://acmeinnovations.com:80/team/",
+        "https://acmeinnovations.com/contact?fbclid=XYZ123&category=sales"
+    ]
+    for r_url in raw_urls:
+        c_url = parser.canonicalize_url(r_url)
+        print(f"   Raw:  {r_url}")
+        print(f"   Clean: {c_url}\n")
+
+    print("--- Testing Internal Link Extraction & Blocklist Filtering ---")
+    sample_links_html = """
+    <html><body>
+        <a href="/about/">About Us</a>
+        <a href="/TEAM">Our Team</a>
+        <a href="/cdn-cgi/l/email-protection">CF Email Protection</a>
+        <a href="/wp-json/wp/v2/posts">WP API</a>
+        <a href="/assets/brochure.pdf">PDF Download</a>
+        <a href="/images/logo.png">Logo Image</a>
+        <a href="/contact?utm_campaign=spring">Contact Form</a>
+    </body></html>
+    """
+    links = parser.extract_internal_links(sample_links_html, "https://acmeinnovations.com")
+    print(f"Extracted {len(links)} links:")
+    for l in links:
+        print(f"   -> {l}")
+
+    assert any("/about" in l for l in links), "Should contain /about"
+    assert not any("cdn-cgi" in l for l in links), "Should block cdn-cgi"
+    assert not any("wp-json" in l for l in links), "Should block wp-json"
+    assert not any(".pdf" in l for l in links), "Should block .pdf"
+
+    print("\nHTML PARSER TEST COMPLETE: All DOM extraction, canonicalization, and blocklists verified!")
 
 if __name__ == "__main__":
     test_parser()

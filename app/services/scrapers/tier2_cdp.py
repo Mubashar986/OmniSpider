@@ -11,7 +11,7 @@ class Tier2CDPScraper:
     Tier 2 Scraper using nodriver (Direct Chrome DevTools Protocol over WebSockets).
     Provides an unblockable fallback engine for Cloudflare Turnstile, JS rendering, and SPA pages.
     """
-    def __init__(self, headless: bool = True):
+    def __init__(self, headless: bool = False):
         self.headless = headless
 
     async def fetch_page_async(
@@ -46,8 +46,12 @@ class Tier2CDPScraper:
             
             # Check for Cloudflare block / unsolved challenge
             is_blocked = (
-                "Just a moment..." in html_content and "Cloudflare" in html_content
+                ("Just a moment..." in html_content and "Cloudflare" in html_content) or
+                "Attention Required! | Cloudflare" in html_content or
+                "cf-browser-verification" in html_content or
+                ("403 Forbidden" in html_content and "cloudflare" in html_content.lower())
             )
+            error_msg = "Cloudflare Turnstile or WAF challenge unresolved" if is_blocked else None
             
             return ScrapeResult(
                 url=url,
@@ -55,7 +59,8 @@ class Tier2CDPScraper:
                 headers={},
                 html_content=html_content,
                 engine_used="nodriver",
-                is_blocked=is_blocked
+                is_blocked=is_blocked,
+                error_message=error_msg
             )
         except Exception as e:
             import traceback
@@ -74,6 +79,12 @@ class Tier2CDPScraper:
                 try:
                     await asyncio.sleep(0.2)  # Drain WebSocket pipes gracefully before loop teardown
                     browser.stop()
+                    if hasattr(browser, "config") and hasattr(browser.config, "process") and browser.config.process:
+                        try:
+                            browser.config.process.kill()
+                            await browser.config.process.wait()
+                        except Exception:
+                            pass
                 except Exception as clean_err:
                     logger.debug(f"Browser stop exception: {clean_err}")
 

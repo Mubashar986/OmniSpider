@@ -1,6 +1,7 @@
+import os
 import re
 import logging
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qs, urlencode
 from typing import Dict, List, Optional, Tuple, Set
 from bs4 import BeautifulSoup
 
@@ -9,6 +10,10 @@ from app.schemas.lead import LeadCreateSchema, PhoneSchema
 
 logger = logging.getLogger(__name__)
 PRIORITY_SUBPAGE_KEYWORDS = ["about", "team", "contact", "leadership", "management", "people", "executives", "staff", "company"]
+
+# Blocklist Patterns & Static Media Extensions (WBS 1.4)
+BLOCKLIST_PATH_PATTERNS = re.compile(r"/(?:cdn-cgi|wp-json|wp-admin|wp-includes|feed|xmlrpc\.php)", re.IGNORECASE)
+BLOCKLIST_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".zip", ".tar", ".gz", ".css", ".js", ".ico", ".mp4", ".mp3", ".xml", ".json"}
 
 # Regular Expression Patterns
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -42,6 +47,34 @@ class HTMLParserService:
         if domain.startswith("www."):
             domain = domain[4:]
         return domain.lower().strip()
+
+    @staticmethod
+    def canonicalize_url(url: str) -> str:
+        """
+        Normalizes URL by lowercasing scheme/host, removing default ports,
+        stripping fragments, trailing slashes, and tracking query params.
+        """
+        if not url:
+            return ""
+        parsed = urlparse(url.strip())
+        scheme = parsed.scheme.lower() or "https"
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        # Remove default ports
+        if ":" in netloc:
+            host, port = netloc.split(":", 1)
+            if (scheme == "http" and port == "80") or (scheme == "https" and port == "443"):
+                netloc = host
+        path = (parsed.path.rstrip("/") if parsed.path != "/" else "/").lower()
+        # Filter out tracking query params
+        cleaned_query = ""
+        if parsed.query:
+            qs = parse_qs(parsed.query)
+            filtered = {k: v for k, v in qs.items() if not k.lower().startswith(("utm_", "fbclid", "gclid"))}
+            if filtered:
+                cleaned_query = "?" + urlencode(filtered, doseq=True)
+        return f"{scheme}://{netloc}{path}{cleaned_query}"
 
     @staticmethod
     def split_full_name(full_name: str) -> Tuple[Optional[str], Optional[str]]:
@@ -138,8 +171,16 @@ class HTMLParserService:
             
             # Must match target domain and not be root/anchor only
             if self.extract_domain(full_url) == domain and parsed.path not in ("", "/"):
-                clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-                found_links.add(clean_url)
+                # Filter system paths and static file extensions (WBS 1.4)
+                if BLOCKLIST_PATH_PATTERNS.search(parsed.path):
+                    continue
+                ext = os.path.splitext(parsed.path)[1].lower()
+                if ext in BLOCKLIST_EXTENSIONS:
+                    continue
+                
+                clean_url = self.canonicalize_url(full_url)
+                if clean_url:
+                    found_links.add(clean_url)
 
         priority_links = []
         other_links = []

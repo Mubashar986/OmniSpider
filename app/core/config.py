@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = "lead_gen_db"
     
     REDIS_URL: str = "rediss://default:password@localhost:6379"
+    SCRAPE_COOLDOWN_DAYS: int = 7
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -25,7 +26,7 @@ class Settings(BaseSettings):
         url = self.REDIS_URL
         if url.startswith("rediss://") and "ssl_cert_reqs" not in url:
             delimiter = "&" if "?" in url else "?"
-            url = f"{url}{delimiter}ssl_cert_reqs=CERT_NONE"
+            url = f"{url}{delimiter}ssl_cert_reqs=none"
         return url
 
 settings = Settings()

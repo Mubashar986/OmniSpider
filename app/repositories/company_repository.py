@@ -24,13 +24,13 @@ class CompanyRepository:
         
         company = db.execute(stmt).scalar_one()
         
-        # Save detected technographics
+        # Save detected technographics with conflict guard (WBS 1.3)
         for tech_name in schema.detected_technologies:
             tech_stmt = pg_insert(CompanyTechnology).values(
                 company_id=company.id,
                 tech_name=tech_name,
                 category="Scraped Stack"
-            )
+            ).on_conflict_do_nothing(index_elements=["company_id", "tech_name"])
             db.execute(tech_stmt)
             
         db.commit()

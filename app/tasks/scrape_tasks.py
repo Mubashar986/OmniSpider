@@ -1,7 +1,12 @@
+import uuid
+import hashlib
 import logging
+import redis
 from dataclasses import asdict
 from typing import Optional, Dict, Any
 
+from app.core.config import settings
+from app.core.redis import get_redis_client
 from app.tasks.celery_app import celery_app
 from app.core.database import SessionLocal
 from app.services.scrapers.tier1_http import Tier1HTTPScraper
@@ -12,9 +17,8 @@ from app.repositories import CompanyRepository, LeadRepository, ScrapeLogReposit
 
 logger = logging.getLogger(__name__)
 
-# Initialize services & repositories
+# Initialize stateless services & repositories
 tier1_scraper = Tier1HTTPScraper()
-tier2_scraper = Tier2CDPScraper(headless=True)
 parser_service = HTMLParserService()
 email_verifier = EmailVerifierService()
 
@@ -23,32 +27,34 @@ lead_repo = LeadRepository()
 scrape_log_repo = ScrapeLogRepository()
 
 @celery_app.task(name="tasks.scrape_url_task", bind=True)
-def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_depth: int = 0) -> Dict[str, Any]:
+def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_depth: int = 0, enable_cooldown: bool = False, session_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Complete End-to-End Celery Scraping Pipeline:
-    1. 7-Day Frequency Cooldown Check (skip if recently scraped)
-    2. Tier 1 HTTP Scrape (curl_cffi)
-    3. Tier 2 Direct-CDP Fallback (nodriver) if Tier 1 blocked
-    4. HTML Data Parsing & Technographic Extraction
-    5. Email & MX Verification
-    6. PostgreSQL Atomic UPSERT (Companies & Leads)
-    7. Scrape Attempt Logging
-    8. Recursive Subpage Crawling (if crawl_depth > 0)
+    1. Tier 1 HTTP Scrape (curl_cffi)
+    2. Tier 2 Direct-CDP Fallback (nodriver) if Tier 1 blocked
+    3. HTML Data Parsing & Technographic Extraction
+    4. Email & MX Verification
+    5. PostgreSQL Atomic UPSERT (Companies & Leads)
+    6. Scrape Attempt Logging
+    7. Recursive Subpage Crawling (with Session Deduplication)
     """
     task_id = self.request.id or "direct"
+    session_id = session_id or str(uuid.uuid4())
     domain = parser_service.extract_domain(url)
-    logger.info(f"[Task {task_id}] Processing URL: {url} (Domain: {domain}, Crawl Depth: {crawl_depth})")
+    logger.info(f"[Task {task_id}] [Session {session_id}] Processing URL: {url} (Domain: {domain}, Crawl Depth: {crawl_depth})")
 
     db = SessionLocal()
     try:
-        # 1. Incremental 7-Day Frequency Control Check (by exact URL)
-        if scrape_log_repo.was_scraped_recently(db, url, days=7):
-            logger.info(f"[Task {task_id}] URL '{url}' was scraped within last 7 days. Skipping fetch.")
+        # 1. Optional Frequency Control Check (Disabled by default; only active if enable_cooldown=True)
+        cooldown_days = settings.SCRAPE_COOLDOWN_DAYS
+        if enable_cooldown and cooldown_days > 0 and scrape_log_repo.was_scraped_recently(db, url, days=cooldown_days):
+            logger.info(f"[Task {task_id}] URL '{url}' was scraped within last {cooldown_days} days. Skipping fetch.")
             return {
                 "status": "skipped",
-                "reason": "scraped_within_7_days",
+                "reason": f"scraped_within_{cooldown_days}_days",
                 "domain": domain,
-                "url": url
+                "url": url,
+                "session_id": session_id
             }
 
         # 2. Scrape Page (Tier 1 -> Tier 2 Fallback)
@@ -59,6 +65,8 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
 
         if not scrape_result or scrape_result.status_code != 200 or scrape_result.is_blocked:
             logger.warning(f"[Task {task_id}] Tier 1 failed or blocked. Executing Tier 2 Fallback (nodriver)...")
+            # Task-scoped CDP scraper instantiation (WBS 1.2)
+            tier2_scraper = Tier2CDPScraper(headless=False)
             scrape_result = tier2_scraper.fetch_page(url)
 
         # Log scrape attempt
@@ -77,7 +85,8 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
                 "status": "failed",
                 "engine_used": scrape_result.engine_used,
                 "status_code": scrape_result.status_code,
-                "error": scrape_result.error_message
+                "error": scrape_result.error_message,
+                "session_id": session_id
             }
 
         # 3. Parse HTML & Extract Structured Schemas
@@ -100,19 +109,52 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
             saved_leads_count += 1
             logger.info(f"[Task {task_id}] Saved Lead: {lead.work_email} (Verified={lead.email_verified})")
 
-        # 6. Recursive Subpage Crawling Dispatch
+        # 6. Recursive Subpage Crawling Dispatch with Session Deduplication (WBS 1.1)
         dispatched_subpages = []
         if crawl_depth > 0:
-            internal_links = parser_service.extract_internal_links(scrape_result.html_content, url, max_links=5)
-            logger.info(f"[Task {task_id}] Discovered {len(internal_links)} internal subpages. Dispatching child tasks at depth={crawl_depth - 1}...")
+            internal_links = parser_service.extract_internal_links(scrape_result.html_content, url, max_links=15)
+            logger.info(f"[Task {task_id}] Discovered {len(internal_links)} internal subpages. Applying Redis SADD dedup check...")
             
-            for sub_url in internal_links:
-                scrape_url_task.delay(sub_url, force_tier=force_tier, crawl_depth=crawl_depth - 1)
-                dispatched_subpages.append(sub_url)
+            try:
+                redis_client = get_redis_client()
+                dedup_key = f"crawl:session:{session_id}:visited"
+                # Mark current URL as visited
+                redis_client.sadd(dedup_key, parser_service.canonicalize_url(url))
+                redis_client.expire(dedup_key, 86400)
+
+                for sub_url in internal_links:
+                    normalized_sub = parser_service.canonicalize_url(sub_url)
+                    is_new = redis_client.sadd(dedup_key, normalized_sub)
+                    redis_client.expire(dedup_key, 86400)
+
+                    if is_new == 0:
+                        logger.info(f"[Task {task_id}] Subpage '{normalized_sub}' already visited in session {session_id}. Skipping dispatch.")
+                        continue
+
+                    task_hash = hashlib.sha256(normalized_sub.encode()).hexdigest()[:16]
+                    child_task_id = f"{session_id}:{task_hash}"
+
+                    scrape_url_task.apply_async(
+                        args=[sub_url],
+                        kwargs={
+                            "force_tier": force_tier,
+                            "crawl_depth": crawl_depth - 1,
+                            "enable_cooldown": enable_cooldown,
+                            "session_id": session_id,
+                        },
+                        task_id=child_task_id
+                    )
+                    dispatched_subpages.append(sub_url)
+            except Exception as red_err:
+                logger.warning(f"[Task {task_id}] Redis dedup check error ({red_err}); falling back to direct dispatch.")
+                for sub_url in internal_links:
+                    scrape_url_task.delay(sub_url, force_tier=force_tier, crawl_depth=crawl_depth - 1, enable_cooldown=enable_cooldown, session_id=session_id)
+                    dispatched_subpages.append(sub_url)
 
         return {
             "status": "success",
             "domain": domain,
+            "session_id": session_id,
             "engine_used": scrape_result.engine_used,
             "company_name": company.name,
             "leads_saved": saved_leads_count,
@@ -121,6 +163,6 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
         }
     except Exception as e:
         logger.exception(f"[Task {task_id}] Pipeline exception on {url}: {e}")
-        return {"status": "error", "error": str(e)}
+        return {"status": "error", "error": str(e), "session_id": session_id}
     finally:
         db.close()

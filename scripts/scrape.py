@@ -6,12 +6,18 @@ from typing import List
 # Add parent directory to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from app.tasks.scrape_tasks import scrape_url_task
 from app.core.database import SessionLocal
 from app.models.company import Company
 from app.models.lead import Lead
 
-def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: int = 0):
+def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: int = 0, enable_cooldown: bool = False):
     print("=" * 70)
     print(" 🚀 UNBLOCKABLE MULTI-TIER LEAD GENERATION SCRAPER")
     print("=" * 70)
@@ -19,6 +25,10 @@ def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: in
     print(f"Recursive Crawl Depth: {crawl_depth}")
     if force_tier:
         print(f"Forced Engine Tier:     {force_tier}")
+    if enable_cooldown:
+        print(f"Cooldown Check:        Enabled (--cooldown)")
+    else:
+        print(f"Cooldown Check:        Disabled (Fresh Fetch Every Time)")
     print("-" * 70)
 
     for idx, target_url in enumerate(urls, 1):
@@ -28,8 +38,8 @@ def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: in
 
         print(f"\n[{idx}/{len(urls)}] Dispatching Scrape Job for: {url}")
         
-        # Dispatch to Celery queue with crawl_depth
-        job = scrape_url_task.delay(url, force_tier=force_tier, crawl_depth=crawl_depth)
+        # Dispatch to Celery queue
+        job = scrape_url_task.delay(url, force_tier=force_tier, crawl_depth=crawl_depth, enable_cooldown=enable_cooldown)
         print(f"   Task ID: {job.id}")
         print("   Waiting for Celery worker (Tier 1 HTTP -> Tier 2 CDP Fallback)...")
 
@@ -47,31 +57,40 @@ def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: in
 
             subpages = result.get("dispatched_subpages", [])
             if subpages:
-                print(f"   Dispatched Subpages ({len(subpages)}):")
+                print(f"\n   Dispatched Subpages ({len(subpages)}):")
                 for sub in subpages:
                     print(f"      -> {sub}")
+                print("\n   ⏳ Waiting for Celery worker to process subpage tasks (10s delay)...")
+                import time
+                time.sleep(10)
 
             if status == "skipped":
                 print(f"   Reason:       {result.get('reason')}")
 
-            elif status == "success":
+            elif status in ("success", "failed"):
                 db = SessionLocal()
                 try:
-                    comp = db.query(Company).filter(Company.domain == result.get("domain")).first()
+                    domain = result.get("domain")
+                    comp = db.query(Company).filter(Company.domain == domain).first() if domain else None
                     if comp:
                         leads = db.query(Lead).filter(Lead.company_id == comp.id).all()
+                        print("\n   ====================================================")
+                        print(f"   📊 ALL EXTRACTED LEADS IN POSTGRESQL FOR {domain.upper()} ({len(leads)})")
+                        print("   ====================================================")
                         if leads:
-                            print("\n   --- Extracted Leads in PostgreSQL ---")
                             for l_idx, lead in enumerate(leads, 1):
                                 verified_tag = "✓ Deliverable" if lead.email_verified else "✗ Unverified"
-                                print(f"      [{l_idx}] {lead.first_name or ''} {lead.last_name or ''}".strip())
+                                name_str = f"{lead.first_name or ''} {lead.last_name or ''}".strip() or "N/A"
+                                print(f"      [{l_idx}] {name_str}")
                                 print(f"          Email:      {lead.work_email} ({verified_tag})")
                                 print(f"          Phones:     {lead.phones}")
                                 if lead.linkedin_url:
                                     print(f"          LinkedIn:   {lead.linkedin_url}")
+                        else:
+                            print("      No leads saved for this domain yet.")
                 finally:
                     db.close()
-            elif status == "failed":
+            elif status == "error":
                 print(f"   Error Log:    {result.get('error')}")
 
         except Exception as e:
@@ -88,6 +107,7 @@ def main():
     parser.add_argument("--tier2", action="store_true", help="Force Tier 2 nodriver CDP engine")
     parser.add_argument("-r", "--recursive", action="store_true", help="Recursively scrape internal subpages (/about, /team, /contact)")
     parser.add_argument("-d", "--depth", type=int, default=0, help="Crawl depth (default 0, set 1 for immediate subpages)")
+    parser.add_argument("-c", "--cooldown", action="store_true", help="Enable 7-day scrape cooldown check (Disabled by default)")
 
     args = parser.parse_args()
 
@@ -105,7 +125,7 @@ def main():
     force_tier = "tier2" if args.tier2 else None
     crawl_depth = 1 if args.recursive and args.depth == 0 else args.depth
 
-    run_generic_scraper(target_urls, force_tier=force_tier, crawl_depth=crawl_depth)
+    run_generic_scraper(target_urls, force_tier=force_tier, crawl_depth=crawl_depth, enable_cooldown=args.cooldown)
 
 if __name__ == "__main__":
     main()
