@@ -22,9 +22,13 @@ class Tier2CDPScraper:
     ) -> ScrapeResult:
         browser = None
         try:
-            logger.info(f"Launching nodriver Chrome instance (headless={self.headless})...")
+            import sys
+            # Enforce headless mode on Linux/WSL since no GUI display server is available
+            effective_headless = True if sys.platform != "win32" else self.headless
+
+            logger.info(f"Launching nodriver Chrome instance (headless={effective_headless})...")
             browser = await uc.start(
-                headless=self.headless,
+                headless=effective_headless,
                 browser_args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
