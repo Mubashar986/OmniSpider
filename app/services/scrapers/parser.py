@@ -1,504 +1,474 @@
-import os
-import re
 import json
 import logging
+import os
+import re
+from collections.abc import Iterable
 from pathlib import Path
-from urllib.parse import urlparse, urljoin, parse_qs, urlencode
-from typing import Dict, List, Optional, Tuple, Set
-from bs4 import BeautifulSoup
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+
+from bs4 import BeautifulSoup, NavigableString, Tag
 import tldextract
-from yarl import URL as YarlURL
 
 from app.core.config import settings
 from app.schemas.company import CompanyCreateSchema
 from app.schemas.lead import LeadCreateSchema, PhoneSchema
 
 logger = logging.getLogger(__name__)
-PRIORITY_SUBPAGE_KEYWORDS = ["about", "team", "contact", "leadership", "management", "people", "executives", "staff", "company"]
 
-# --- Dynamic Config Loading (Phase 1: Config Externalization) ---
-_CONFIG_DIR = Path(__file__).resolve().parent.parent.parent.parent / "config"
+PRIORITY_SUBPAGE_KEYWORDS = ["about", "team", "contact", "leadership", "management", "people", "executives", "staff", "company"]
+_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
+
+
+def _load_json_config(filename: str) -> Dict[str, object]:
+    try:
+        with (_CONFIG_DIR / filename).open(encoding="utf-8") as config_file:
+            return json.load(config_file)
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning("Unable to load parser config %s: %s", filename, error)
+        return {}
+
 
 def _build_blocklist_regex() -> re.Pattern:
-    """Build blocklist regex from settings instead of hardcoded patterns."""
-    patterns = settings.get_blocklist_patterns()
-    escaped = [re.escape(p) for p in patterns]
-    return re.compile(r"/(?:" + "|".join(escaped) + r")", re.IGNORECASE)
+    patterns = [re.escape(pattern) for pattern in settings.get_blocklist_patterns()]
+    return re.compile(r"/(?:" + "|".join(patterns) + r")", re.IGNORECASE) if patterns else re.compile(r"$^")
 
-def _load_json_config(filename: str) -> dict:
-    """Load a JSON config file from the config/ directory."""
-    filepath = _CONFIG_DIR / filename
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        logger.warning(f"Config file not found: {filepath}. Using empty defaults.")
-        return {}
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in {filepath}: {e}. Using empty defaults.")
-        return {}
 
-# Load dynamic configs at module import time
 BLOCKLIST_PATH_PATTERNS = _build_blocklist_regex()
 BLOCKLIST_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".zip", ".tar", ".gz", ".css", ".js", ".ico", ".mp4", ".mp3", ".xml", ".json"}
-TECH_SIGNATURES = _load_json_config("tech_signatures.json")
+
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_REGEX = re.compile(r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
+LINKEDIN_REGEX = re.compile(r"https?://(?:[a-z]{2,3}\.)?(?:www\.)?linkedin\.com/(?:company|in)/[a-zA-Z0-9_-]+/?", re.IGNORECASE)
+
+FREE_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "hotmail.com",
+    "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "aol.com",
+    "proton.me", "protonmail.com", "gmx.com", "mail.com",
+}
+PLACEHOLDER_EMAILS = {
+    "you@work.com", "name@domain.com", "email@example.com", "user@example.com",
+    "test@example.com", "john.doe@example.com", "your@email.com",
+}
+SOCIAL_OR_UTILITY_DOMAINS = {
+    "linkedin.com", "facebook.com", "instagram.com", "twitter.com", "x.com",
+    "youtube.com", "tiktok.com", "pinterest.com", "wa.me", "whatsapp.com",
+    "google.com", "maps.google.com", "apple.com", "play.google.com",
+}
+CONTACT_SCOPE_TAGS = {"article", "li", "tr", "section", "address", "figure", "div", "p"}
+TITLE_PATTERN = re.compile(
+    r"\b(?:chief\s+(?:executive|technology|operating|financial|marketing|revenue)\s+officer|"
+    r"ceo|cto|coo|cfo|cmo|founder|co-?founder|president|vice\s+president|vp|"
+    r"director|manager|partner|owner|head\s+of\s+[a-z ]+)\b",
+    re.IGNORECASE,
+)
+
+DEFAULT_TECH_SIGNATURES = {
+    "Next.js": [r"_next/static", r"__NEXT_DATA__"],
+    "React": [r"react\.production\.min\.js", r"react-dom"],
+    "Vue.js": [r"vue\.global\.js", r"v-attr"],
+    "WordPress": [r"wp-content", r"wp-includes"],
+    "Shopify": [r"cdn\.shopify\.com", r"Shopify\.theme"],
+    "Cloudflare": [r"cloudflare\.com", r"__cf_chl_opt"],
+    "Google Analytics": [r"googletagmanager\.com", r"gtag"],
+    "Tailwind CSS": [r"tailwind", r"tw-"],
+    "Bootstrap": [r"bootstrap\.min\.css"],
+    "HubSpot": [r"js\.hs-scripts\.com", r"hubspot"],
+    "Stripe": [r"js\.stripe\.com"],
+}
+TECH_SIGNATURES = _load_json_config("tech_signatures.json") or DEFAULT_TECH_SIGNATURES
 FIELD_MAPPINGS = _load_json_config("field_mappings.json")
 DIRECTORY_PROFILES = _load_json_config("directory_profiles.json")
 
-# Regular Expression Patterns
-EMAIL_REGEX = re.compile(
-    r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.(?:com|org|net|io|co|eu|dev|tech|info|biz|uk|us|ca|de|fr|au|in|agency|digital|systems|online|studio|solutions|company|global|[a-zA-Z]{2,10})\b",
-    re.IGNORECASE
-)
-PHONE_REGEX = re.compile(r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
-LINKEDIN_REGEX = re.compile(r"https?://(?:www\.)?linkedin\.com/(?:company|in)/[a-zA-Z0-9_-]+/?")
-
-try:
-    import phonenumbers
-    from phonenumbers import PhoneNumberMatcher
-    HAS_PHONENUMBERS = True
-except ImportError:
-    HAS_PHONENUMBERS = False
 
 class HTMLParserService:
-    """
-    Service for parsing unstructured HTML content, extracting contact information,
-    normalizing lead schemas, and detecting technographic stacks.
-    """
+    """Extract company and contact data without crossing DOM-card boundaries."""
 
     @staticmethod
     def extract_domain(url: str) -> str:
-        parsed = urlparse(url)
-        domain = parsed.netloc or parsed.path
-        if domain.startswith("www."):
-            domain = domain[4:]
-        return domain.lower().strip()
+        """Return a normalized host, including correct handling of ports and IPv6."""
+        if not url:
+            return ""
+        parsed = urlsplit(url if "://" in url else f"//{url}")
+        return (parsed.hostname or "").lower().removeprefix("www.")
 
     @staticmethod
     def canonicalize_url(url: str) -> str:
-        """
-        Normalizes URL by lowercasing scheme/host, removing default ports,
-        stripping fragments, trailing slashes, and removing directory filter/tracking params.
-        """
+        """Normalize host/default ports and remove fragments and common tracking params."""
         if not url:
             return ""
-        parsed = urlparse(url.strip())
+        parsed = urlsplit(url.strip() if "://" in url else f"https://{url.strip()}")
+        if not parsed.hostname:
+            return ""
         scheme = parsed.scheme.lower() or "https"
-        netloc = parsed.netloc.lower()
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
-        # Remove default ports using yarl for RFC-compliant parsing (Issue #9)
+        host = parsed.hostname.lower().removeprefix("www.")
+        if ":" in host:  # urlsplit().hostname removes IPv6 brackets.
+            host = f"[{host}]"
         try:
-            yurl = YarlURL(f"{scheme}://{netloc}{parsed.path}")
-            netloc = yurl.host or netloc
-            if yurl.explicit_port and (
-                (scheme == "http" and yurl.port == 80) or
-                (scheme == "https" and yurl.port == 443)
-            ):
-                pass  # yarl.host already strips default ports
-        except Exception:
-            # Fallback to manual splitting if yarl fails
-            if ":" in netloc:
-                host, port = netloc.split(":", 1)
-                if (scheme == "http" and port == "80") or (scheme == "https" and port == "443"):
-                    netloc = host
-        path = (parsed.path.rstrip("/") if parsed.path != "/" else "/").lower()
-
-        # For directory profile/company/entity detail pages, strip query strings completely
-        # to ensure exact 1:1 Redis deduplication across parameter variants
-        # Profile paths loaded from config/directory_profiles.json (Issue #8)
-        all_profile_paths = set()
-        for dir_config in DIRECTORY_PROFILES.values():
-            all_profile_paths.update(dir_config.get("profile_paths", []))
-        # Fallback defaults if config is empty
-        all_profile_paths.update(["/profile/", "/company/", "/developer/", "/agency/", "/directory/"])
-        if any(kw in path for kw in all_profile_paths):
-            return f"{scheme}://{netloc}{path}"
-
-        # Otherwise filter out tracking, filter, and pagination query params
-        # Ignored params loaded from settings (Issue #4)
-        cleaned_query = ""
-        if parsed.query:
-            qs = parse_qs(parsed.query)
+            port = parsed.port
+        except ValueError:
+            return ""
+        netloc = host if port in (None, 80 if scheme == "http" else 443 if scheme == "https" else None) else f"{host}:{port}"
+        path = parsed.path.rstrip("/") or "/"
+        profile_paths = {
+            profile_path.lower()
+            for profile in DIRECTORY_PROFILES.values()
+            if isinstance(profile, dict)
+            for profile_path in profile.get("profile_paths", [])
+        }
+        if any(profile_path in path.lower() for profile_path in profile_paths):
+            query = ""
+        else:
             ignored = settings.get_ignored_query_params()
-            filtered = {
-                k: v for k, v in qs.items() 
-                if not k.lower().startswith(ignored) and k.lower() not in ignored
-            }
-            if filtered:
-                cleaned_query = "?" + urlencode(filtered, doseq=True)
-        return f"{scheme}://{netloc}{path}{cleaned_query}"
+            query = urlencode(
+                [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                 if key.lower() not in ignored and not key.lower().startswith(ignored)],
+                doseq=True,
+            )
+        return urlunsplit((scheme, netloc, path, query, ""))
 
     @staticmethod
     def split_full_name(full_name: str) -> Tuple[Optional[str], Optional[str]]:
-        if not full_name:
-            return None, None
-        parts = full_name.strip().split()
-        if len(parts) == 1:
-            return parts[0], None
-        return parts[0], " ".join(parts[1:])
+        parts = full_name.strip().split() if full_name else []
+        return (parts[0], " ".join(parts[1:]) or None) if parts else (None, None)
 
-    def extract_emails(self, html: str, domain: str) -> Set[str]:
-        valid_emails = set()
-        for match in EMAIL_REGEX.finditer(html):
-            email_lower = match.group(0).lower().strip()
-            
-            # Fix Issue #14: Split on @ first, validate domain part independently
-            if "@" not in email_lower:
+    @staticmethod
+    def _soup(html: str) -> BeautifulSoup:
+        soup = BeautifulSoup(html or "", "html.parser")
+        for tag in soup(["script", "style", "template", "noscript"]):
+            # JSON-LD is structured company metadata, not visible contact text.
+            if tag.name == "script" and tag.get("type", "").lower() == "application/ld+json":
                 continue
-            local_part, domain_part = email_lower.rsplit("@", 1)
-            
-            # Use tldextract to cleanly identify TLD boundary (Issue #5)
-            try:
-                ext = tldextract.extract(domain_part)
-                if ext.domain and ext.suffix:
-                    # Reconstruct clean domain from tldextract parts
-                    clean_domain = f"{ext.domain}.{ext.suffix}"
-                    if ext.subdomain:
-                        clean_domain = f"{ext.subdomain}.{clean_domain}"
-                    email_lower = f"{local_part}@{clean_domain}"
-                else:
-                    continue  # Invalid domain, skip
-            except Exception:
-                continue  # tldextract failed, skip this email
+            tag.decompose()
+        return soup
 
-            # Ignore common image file extensions falsely matched by regex
-            if not any(email_lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp"]):
-                valid_emails.add(email_lower)
-        return valid_emails
-
-    def extract_phones(self, html: str, default_region: str = "US") -> List[PhoneSchema]:
-        phones = []
-        seen = set()
-        # Multi-region parallel scan (Issue #10)
-        regions = [default_region] + [r for r in ["US", "GB", "DE", "IN", "AU"] if r != default_region]
-
-        if HAS_PHONENUMBERS:
-            try:
-                for region in regions:
-                    for match in PhoneNumberMatcher(html, region):
-                        num_obj = match.number
-                        if phonenumbers.is_valid_number(num_obj) or phonenumbers.is_possible_number(num_obj):
-                            num_str = phonenumbers.format_number(num_obj, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
-                            if num_str not in seen:
-                                seen.add(num_str)
-                                # Use phonenumbers.number_type() for accurate classification (Issue #11)
-                                pn_type = phonenumbers.number_type(num_obj)
-                                type_map = {
-                                    phonenumbers.PhoneNumberType.MOBILE: "mobile",
-                                    phonenumbers.PhoneNumberType.FIXED_LINE: "office",
-                                    phonenumbers.PhoneNumberType.FIXED_LINE_OR_MOBILE: "office",
-                                    phonenumbers.PhoneNumberType.TOLL_FREE: "toll_free",
-                                    phonenumbers.PhoneNumberType.VOIP: "voip",
-                                }
-                                phone_type = type_map.get(pn_type, "office")
-                                phones.append(PhoneSchema(number=num_str, type=phone_type))
-                                if len(phones) >= 5:
-                                    break
-                    if len(phones) >= 5:
-                        break
-            except Exception as e:
-                logger.debug(f"phonenumbers extraction error: {e}")
-
-        # Fallback to regex finditer if phonenumbers unavailable or yielded nothing
-        if not phones:
-            for match in PHONE_REGEX.finditer(html):
-                num_str = match.group(0).strip()
-                if len(num_str) >= 10 and num_str not in seen:
-                    seen.add(num_str)
-                    phone_type = "office"  # Default to office for regex fallback
-                    phones.append(PhoneSchema(number=num_str, type=phone_type))
-                    if len(phones) >= 5:
-                        break
-
-        return phones
-
-    def extract_linkedin_urls(self, html: str) -> List[str]:
-        matches = LINKEDIN_REGEX.findall(html)
-        return list(set(matches))
-
-    def detect_technologies(self, html: str) -> List[str]:
-        detected = []
-        for tech, patterns in TECH_SIGNATURES.items():
-            if any(re.search(pat, html, re.IGNORECASE) for pat in patterns):
-                detected.append(tech)
-        return detected
-
-    def extract_target_company_info(self, html_content: str, page_url: str) -> Tuple[str, str, str, Optional[str], Optional[str]]:
-        """
-        Hybrid target extraction: Isolates the true Target Company Identity,
-        Firmographics (industry, size), and official website URL from directory profiles.
-        """
-        page_domain = self.extract_domain(page_url)
-        # Directory domains loaded from settings (Issue #6)
-        directory_domains = settings.get_directory_domains()
-        is_directory = any(dir_domain in page_domain for dir_domain in directory_domains)
-        
-        target_website = None
-        target_name = None
-        industry = None
-        company_size = None
-
-        if is_directory:
-            soup = BeautifulSoup(html_content, "html.parser")
-            
-            # Pass 1: JSON-LD Organization Schema Parsing with Domain-Exclusion Scoring (Bug P-1 Fix)
-            # Instead of first-match-wins, score ALL JSON-LD blocks and pick the best one
-            candidates = []
-            org_types = {"Organization", "Corporation", "LocalBusiness", "ProfessionalService",
-                         "MedicalOrganization", "EducationalOrganization", "Store", "GovernmentOrganization"}
-            
-            for raw_json in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html_content, re.DOTALL | re.IGNORECASE):
-                try:
-                    data = json.loads(raw_json.strip())
-                    items = data if isinstance(data, list) else [data]
-                    # Handle @graph arrays
-                    for item in items:
-                        if isinstance(item, dict) and "@graph" in item:
-                            items.extend(item["@graph"])
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        item_type = item.get("@type", "")
-                        if isinstance(item_type, list):
-                            item_type = item_type[0] if item_type else ""
-                        if item_type not in org_types:
-                            continue
-                        
-                        # Score this block
-                        score = 0
-                        item_url = item.get("url") or item.get("sameAs") or ""
-                        item_domain = self.extract_domain(item_url) if item_url else ""
-                        
-                        # +10 if URL domain differs from page_domain (this is the actual target company!)
-                        if item_domain and item_domain != page_domain:
-                            score += 10
-                        # +5 for specific business subtypes (LocalBusiness is more specific than Organization)
-                        if item_type in ("LocalBusiness", "ProfessionalService", "Corporation"):
-                            score += 5
-                        # +3 if has employee count (directory headers rarely have this)
-                        if any(item.get(k) for k in ["numberOfEmployees", "employees", "employeeCount"]):
-                            score += 3
-                        
-                        candidates.append({"item": item, "score": score, "domain": item_domain})
-                except Exception as e:
-                    logger.debug(f"JSON-LD parsing error: {e}")
-                    continue
-            
-            # Pick highest-scoring candidate
-            if candidates:
-                candidates.sort(key=lambda c: c["score"], reverse=True)
-                best = candidates[0]["item"]
-                
-                # Use configurable field mappings (Issue #12)
-                name_keys = FIELD_MAPPINGS.get("company_name", ["name"])
-                website_keys = FIELD_MAPPINGS.get("website", ["url", "sameAs"])
-                industry_keys = FIELD_MAPPINGS.get("industry", ["knowsAbout", "genre"])
-                size_keys = FIELD_MAPPINGS.get("company_size", ["numberOfEmployees", "employees", "employeeCount"])
-
-                for nk in name_keys:
-                    if not target_name and best.get(nk):
-                        target_name = best.get(nk)
-                        break
-                for wk in website_keys:
-                    if not target_website and best.get(wk):
-                        target_website = best.get(wk)
-                        break
-                for ik in industry_keys:
-                    if not industry and best.get(ik):
-                        industry = best.get(ik)
-                        break
-                for sk in size_keys:
-                    num_emp = best.get(sk)
-                    if num_emp and not company_size:
-                        company_size = str(num_emp.get("value")) if isinstance(num_emp, dict) else str(num_emp)
-                        break
-
-            # Pass 2: Outbound Website Link Heuristics
-            if not target_website:
-                for a_tag in soup.find_all("a", href=True):
-                    href = a_tag["href"].strip()
-                    # Handle redirect params like clutch.co/redirect?url=https://www.openxcell.com
-                    if "redirect" in href and "url=" in href:
-                        qs = parse_qs(urlparse(href).query)
-                        if "url" in qs:
-                            href = qs["url"][0]
-
-                    if href.startswith("http"):
-                        ext_domain = self.extract_domain(href)
-                        if ext_domain and ext_domain != page_domain and not any(d in ext_domain for d in ["linkedin.com", "facebook.com", "twitter.com", "instagram.com"]):
-                            target_website = href
-                            break
-
-            # Pass 3: CSS Selectors for Company Name, Industry, Size
-            if not target_name:
-                h1_tag = soup.find("h1")
-                if h1_tag:
-                    target_name = h1_tag.get_text(strip=True)
-
-            # Industry selector (Clutch / GoodFirms tags)
-            # Industry selector (Issue 13 Fix: Semantic HTML + Microdata + Class fallback)
-            if not industry:
-                # 1. Standard Microdata itemprop="knowsAbout" or "genre"
-                ind_elem = soup.find(attrs={"itemprop": re.compile(r"knowsAbout|genre|industry|category", re.I)})
-                if ind_elem:
-                    industry = ind_elem.get_text(strip=True)
-                else:
-                    # 2. CSS class fallback
-                    ind_tag = soup.find(class_=re.compile(r"industry|field-service|category-name|sector", re.I))
-                    if ind_tag:
-                        industry = ind_tag.get_text(strip=True)
-
-            # Company Size selector
-            if not company_size:
-                # Exclude script and style tags
-                for script_or_style in soup(["script", "style"]):
-                    script_or_style.decompose()
-                size_tag = soup.find(text=re.compile(r"\d+\s*[-–]\s*\d+|\d+\s*\+", re.I))
-                if size_tag:
-                    company_size = size_tag.strip()
-
-        # Fallback for direct company sites or missing directory target website
-        if not target_website or self.extract_domain(target_website) == page_domain:
-            target_website = page_url if page_url.startswith("http") else f"https://{page_url}"
-            target_domain = page_domain
-        else:
-            target_domain = self.extract_domain(target_website)
-
-        if not target_name:
-            target_name = target_domain.split(".")[0].capitalize()
-
-        return target_domain, target_name, target_website, industry, company_size
-
-    def extract_executive_titles(self, html_content: str) -> Dict[str, str]:
-        """
-        Extracts executive job designations (CEO, CTO, VP, Founder, Director) from profile HTML
-        using Microdata, ARIA tags, and Semantic HTML structures (Issue 13 Fix).
-        """
-        soup = BeautifulSoup(html_content, "html.parser")
-        titles = {}
-        title_keywords = re.compile(r"\b(?:CEO|CTO|CFO|COO|Founder|Co-Founder|President|Vice President|VP|Director|Managing Director|Head of \w+|Partner)\b", re.I)
-
-        # 1. Microdata itemprop="jobTitle" or "title"
-        for title_elem in soup.find_all(attrs={"itemprop": re.compile(r"jobTitle|title", re.I)}):
-            text = title_elem.get_text(separator=" ", strip=True)
-            match = title_keywords.search(text)
-            if match:
-                title = match.group(0).title()
-                titles[title.lower()] = title
-
-        # 2. Search team / leadership / bio blocks & article cards
-        for block in soup.find_all(["article", "figure", "div", "section"], class_=re.compile(r"person|team|executive|leader|profile|bio|member|staff|card", re.I)):
-            text = block.get_text(separator=" ", strip=True)
-            match = title_keywords.search(text)
-            if match:
-                title = match.group(0).title()
-                titles[title.lower()] = title
-
-        return titles
-
-    def parse_html(self, html_content: str, url: str) -> Tuple[CompanyCreateSchema, List[LeadCreateSchema]]:
-        # 1. Extract Target Company Identity & Firmographics (Issues 2.1 & 2.3)
-        domain, company_name, website_url, industry, company_size = self.extract_target_company_info(html_content, url)
-        detected_tech = self.detect_technologies(html_content)
-        
-        company = CompanyCreateSchema(
-            domain=domain,
-            name=company_name,
-            website_url=website_url,
-            industry=industry,
-            company_size=company_size,
-            detected_technologies=detected_tech
+    @staticmethod
+    def _visible_text(element: Tag) -> str:
+        return " ".join(
+            text.strip() for text in element.find_all(string=True)
+            if text.strip() and text.parent and text.parent.name not in {"script", "style", "template", "noscript"}
         )
 
-        # 2. Extract Lead Contacts, Phones & Executive Titles (Issue 3.4)
-        emails = self.extract_emails(html_content, domain)
-        phones = self.extract_phones(html_content)
-        linkedin_urls = self.extract_linkedin_urls(html_content)
-        executive_titles = self.extract_executive_titles(html_content)
+    @staticmethod
+    def _clean_email(value: str) -> Optional[str]:
+        email = value.strip().lower().strip("<>[](){}.,;:'\"")
+        if not EMAIL_REGEX.fullmatch(email):
+            return None
+        local_part, domain = email.rsplit("@", 1)
+        extracted = tldextract.extract(domain)
+        if not extracted.domain or not extracted.suffix:
+            return None
+        clean_domain = ".".join(part for part in (extracted.subdomain, extracted.domain, extracted.suffix) if part)
+        return f"{local_part}@{clean_domain}"
 
-        # Infer default executive designation if found
-        default_title = list(executive_titles.values())[0] if executive_titles else None
+    @classmethod
+    def is_business_email(cls, email: str) -> bool:
+        cleaned = cls._clean_email(email)
+        if not cleaned or cleaned in PLACEHOLDER_EMAILS:
+            return False
+        local_part, domain = cleaned.rsplit("@", 1)
+        if domain in FREE_EMAIL_DOMAINS:
+            return False
+        return local_part not in {"you", "name", "email", "user", "example", "test"}
 
-        leads = []
-        for idx, email in enumerate(emails):
-            prefix = email.split("@")[0]
-            first_name, last_name = self.split_full_name(prefix.replace(".", " ").replace("_", " ").title())
-            
-            lead = LeadCreateSchema(
+    @classmethod
+    def _emails_in_text(cls, text: str) -> Set[str]:
+        return {
+            email for match in EMAIL_REGEX.findall(text or "")
+            if (email := cls._clean_email(match)) and cls.is_business_email(email)
+        }
+
+    @classmethod
+    def _emails_in_element(cls, element: Tag) -> Set[str]:
+        emails = cls._emails_in_text(cls._visible_text(element))
+        for link in element.select('a[href^="mailto:"]'):
+            emails.update(cls._emails_in_text(link.get("href", "")[7:].split("?", 1)[0]))
+        return emails
+
+    def extract_emails(self, html: str, domain: str = "") -> Set[str]:
+        """Extract only visible, non-placeholder business email addresses."""
+        return self._emails_in_element(self._soup(html))
+
+    @staticmethod
+    def _normalise_phone(value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip(" .,-")
+
+    @classmethod
+    def _phones_in_element(cls, element: Tag) -> List[PhoneSchema]:
+        candidates = PHONE_REGEX.findall(cls._visible_text(element))
+        candidates.extend(link.get("href", "")[4:].split("?", 1)[0] for link in element.select('a[href^="tel:"]'))
+        phones: List[PhoneSchema] = []
+        seen = set()
+        for candidate in candidates:
+            number = cls._normalise_phone(candidate)
+            key = re.sub(r"\D", "", number)
+            if len(key) < 10 or key in seen:
+                continue
+            seen.add(key)
+            phones.append(PhoneSchema(number=number, type="mobile" if number.startswith("+") else "office"))
+        return phones
+
+    def extract_phones(self, html: str) -> List[PhoneSchema]:
+        return self._phones_in_element(self._soup(html))
+
+    @staticmethod
+    def _linkedin_urls_in_element(element: Tag, profile_only: bool = False) -> List[str]:
+        urls = []
+        for link in element.find_all("a", href=True):
+            match = LINKEDIN_REGEX.search(link["href"])
+            if match:
+                candidate = match.group(0).rstrip("/")
+                if not profile_only or "/in/" in candidate.lower():
+                    urls.append(candidate)
+        return list(dict.fromkeys(urls))
+
+    def extract_linkedin_urls(self, html: str) -> List[str]:
+        return self._linkedin_urls_in_element(self._soup(html))
+
+    def detect_technologies(self, html: str) -> List[str]:
+        return [tech for tech, patterns in TECH_SIGNATURES.items() if any(re.search(pattern, html, re.IGNORECASE) for pattern in patterns)]
+
+    @classmethod
+    def _contact_scope(cls, source: Tag) -> Tag:
+        """Find the closest meaningful card that does not contain many contacts."""
+        fallback = source.parent if source.parent and isinstance(source.parent, Tag) else source
+        for ancestor in [source, *source.parents]:
+            if not isinstance(ancestor, Tag) or ancestor.name not in CONTACT_SCOPE_TAGS:
+                continue
+            if len(cls._emails_in_element(ancestor)) <= 3:
+                return ancestor
+        return fallback
+
+    @staticmethod
+    def _name_from_email(email: str) -> Tuple[Optional[str], Optional[str]]:
+        local = email.split("@", 1)[0].split("+", 1)[0]
+        local = re.sub(r"\d+$", "", local)
+        tokens = [token for token in re.split(r"[._-]+", local) if token and token.isalpha()]
+        if len(tokens) == 1:
+            # A doubled boundary character is a common joined-name pattern: aminaameer -> Amina Ameer.
+            joined = re.fullmatch(r"([a-z]{2,}?)([a-z])\2([a-z]{2,})", tokens[0].lower())
+            if joined:
+                tokens = [joined.group(1) + joined.group(2), joined.group(2) + joined.group(3)]
+        if not tokens or tokens[0] in {"info", "contact", "sales", "support", "hello", "admin", "team"}:
+            return None, None
+        return HTMLParserService.split_full_name(" ".join(token.capitalize() for token in tokens))
+
+    @staticmethod
+    def _title_from_text(text: str) -> Optional[str]:
+        match = TITLE_PATTERN.search(text)
+        return re.sub(r"\s+", " ", match.group(0)).title() if match else None
+
+    def _lead_records(self, soup: BeautifulSoup) -> Iterable[Tuple[str, Tag]]:
+        """Yield each email once with its smallest useful DOM scope, in document order."""
+        records: Dict[str, Tag] = {}
+        for node in soup.find_all(string=True):
+            if not isinstance(node, NavigableString) or not node.parent or node.parent.name in {"script", "style", "template", "noscript"}:
+                continue
+            for email in self._emails_in_text(str(node)):
+                scope = self._contact_scope(node.parent)
+                previous = records.get(email)
+                if previous is None or len(scope.get_text(" ", strip=True)) < len(previous.get_text(" ", strip=True)):
+                    records[email] = scope
+        for link in soup.select('a[href^="mailto:"]'):
+            for email in self._emails_in_text(link.get("href", "")[7:].split("?", 1)[0]):
+                scope = self._contact_scope(link)
+                previous = records.get(email)
+                if previous is None or len(scope.get_text(" ", strip=True)) < len(previous.get_text(" ", strip=True)):
+                    records[email] = scope
+        return records.items()
+
+    @staticmethod
+    def _unwrap_redirect(url: str) -> str:
+        parsed = urlsplit(url)
+        for key, value in parse_qsl(parsed.query):
+            if key.lower() in {"url", "u", "target", "destination", "redirect", "redirect_url"} and value.startswith(("http://", "https://")):
+                return value
+        return url
+
+    @staticmethod
+    def _is_external(candidate_url: str, page_domain: str) -> bool:
+        candidate_domain = HTMLParserService.extract_domain(candidate_url)
+        return bool(candidate_domain and candidate_domain != page_domain and not candidate_domain.endswith(f".{page_domain}"))
+
+    def extract_target_website(self, soup: BeautifulSoup, page_url: str) -> Optional[str]:
+        """Select a labelled external company site, never an arbitrary page-level link."""
+        page_domain = self.extract_domain(page_url)
+        if not any(directory_domain == page_domain or page_domain.endswith(f".{directory_domain}") for directory_domain in settings.get_directory_domains()):
+            return None
+        candidates: List[Tuple[int, str]] = []
+        for link in soup.find_all("a", href=True):
+            candidate = self._unwrap_redirect(urljoin(page_url, link["href"].strip()))
+            if not candidate.startswith(("http://", "https://")) or not self._is_external(candidate, page_domain):
+                continue
+            candidate_domain = self.extract_domain(candidate)
+            if any(candidate_domain == blocked or candidate_domain.endswith(f".{blocked}") for blocked in SOCIAL_OR_UTILITY_DOMAINS):
+                continue
+            context = " ".join(filter(None, [link.get_text(" ", strip=True), link.get("aria-label"), link.get("title"), link.parent.get_text(" ", strip=True) if link.parent else ""])).lower()
+            score = 0
+            if any(keyword in context for keyword in ("website", "visit site", "visit website", "company site", "official site")):
+                score += 100
+            if link.get("rel") and "nofollow" not in link.get("rel", []):
+                score += 5
+            path = urlsplit(candidate).path.rstrip("/")
+            if not path:
+                score += 10
+            if score >= 100:
+                candidates.append((score, candidate))
+        if not candidates:
+            return None
+        _, best = max(candidates, key=lambda item: item[0])
+        parsed = urlsplit(best)
+        return urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+
+    @staticmethod
+    def clean_company_size(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if not re.search(r"\b(?:employees?|staff|team|people|personnel)\b", normalized, re.IGNORECASE):
+            return None
+        match = re.search(r"(?<!\d)(\d+\s*(?:[-\u2013]|to)\s*\d+|\d+\s*\+?)(?!\d)", normalized)
+        return re.sub(r"\s+", "", match.group(1)).replace("\u2013", "-") if match else None
+
+    @staticmethod
+    def clean_industry(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        cleaned = re.sub(r"\s*-?\s*\d+(?:\.\d+)?\s*%", "", value)
+        cleaned = re.sub(r"\b(?:industry|industry\s+focus)\b\s*:?", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", cleaned)
+        parts = [re.sub(r"\s+", " ", part).strip(" -|,;") for part in re.split(r"[|;\n]", cleaned)]
+        return "; ".join(dict.fromkeys(part for part in parts if len(part) > 1)) or None
+
+    @classmethod
+    def _labelled_value(cls, soup: BeautifulSoup, labels: Tuple[str, ...]) -> Optional[str]:
+        """Get compact, visible text around a field label without scanning page navigation."""
+        for node in soup.find_all(string=True):
+            if not node.parent or node.parent.name in {"script", "style", "template", "noscript"}:
+                continue
+            if not any(label in node.strip().lower() for label in labels):
+                continue
+            for ancestor in [node.parent, *list(node.parents)[:3]]:
+                if not isinstance(ancestor, Tag):
+                    continue
+                value = cls._visible_text(ancestor)
+                if 0 < len(value) <= 350:
+                    return value
+        return None
+
+    def _json_ld_organizations(self, soup: BeautifulSoup, page_domain: str) -> List[Tuple[int, Dict[str, object]]]:
+        organizations: List[Tuple[int, Dict[str, object]]] = []
+        for script in soup.select('script[type="application/ld+json"]'):
+            try:
+                payload = json.loads(script.string or script.get_text())
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            stack = payload if isinstance(payload, list) else [payload]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, dict) and isinstance(item.get("@graph"), list):
+                    stack.extend(item["@graph"])
+                if not isinstance(item, dict):
+                    continue
+                types = item.get("@type", [])
+                types = [types] if isinstance(types, str) else types
+                if not any(str(type_).lower() in {"organization", "corporation", "localbusiness", "professionalservice"} for type_ in types):
+                    continue
+                score = 0
+                official_url = str(item.get("url", ""))
+                if self._is_external(official_url, page_domain):
+                    score += 50
+                if item.get("name"):
+                    score += 10
+                organizations.append((score, item))
+        return organizations
+
+    @staticmethod
+    def _mapped_value(record: Dict[str, object], mapping_name: str, defaults: Tuple[str, ...]) -> Optional[object]:
+        mapping = FIELD_MAPPINGS.get(mapping_name, defaults)
+        keys = mapping if isinstance(mapping, list) else defaults
+        return next((record[key] for key in keys if record.get(key)), None)
+
+    def extract_target_company_info(self, html_content: str, page_url: str) -> Dict[str, Optional[str]]:
+        """Extract directory-aware company metadata and a safely canonicalized website."""
+        soup = self._soup(html_content)
+        page_domain = self.extract_domain(page_url)
+        external_website = self.extract_target_website(soup, page_url)
+        orgs = self._json_ld_organizations(soup, page_domain)
+        best_org = max(orgs, key=lambda item: item[0])[1] if orgs else {}
+        json_website_value = self._mapped_value(best_org, "website", ("url", "sameAs", "mainEntityOfPage")) if best_org else ""
+        if isinstance(json_website_value, list):
+            json_website_value = next((value for value in json_website_value if isinstance(value, str) and value.startswith(("http://", "https://"))), "")
+        json_website = str(json_website_value or "")
+        website = external_website or (self.canonicalize_url(json_website) if self._is_external(json_website, page_domain) else None)
+        if website:
+            parsed = urlsplit(website)
+            website = urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+        else:
+            parsed = urlsplit(self.canonicalize_url(page_url))
+            website = urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+
+        directory_profile = DIRECTORY_PROFILES.get(page_domain, {})
+        name_selector = directory_profile.get("company_name_selector") if isinstance(directory_profile, dict) else None
+        industry_selector = directory_profile.get("industry_selector") if isinstance(directory_profile, dict) else None
+        profile_name = soup.select_one(name_selector).get_text(" ", strip=True) if name_selector and soup.select_one(name_selector) else None
+        profile_industry = soup.select_one(industry_selector).get_text(" | ", strip=True) if industry_selector and soup.select_one(industry_selector) else None
+        h1 = soup.find("h1")
+        name_value = self._mapped_value(best_org, "company_name", ("name", "legalName", "alternateName")) if best_org else None
+        name = str(name_value or profile_name or (h1.get_text(" ", strip=True) if h1 else "") or page_domain.split(".")[0]).strip()
+        industry = self._mapped_value(best_org, "industry", ("industry", "knowsAbout", "genre")) if best_org else None
+        if isinstance(industry, list):
+            industry = " | ".join(map(str, industry))
+        industry = industry or profile_industry or self._labelled_value(soup, ("industry", "industry focus", "industries"))
+        size = self._mapped_value(best_org, "company_size", ("numberOfEmployees", "employees", "employeeCount")) if best_org else None
+        if isinstance(size, dict):
+            size = size.get("value") or size.get("minValue")
+        size = size or self._labelled_value(soup, ("company size", "team size", "employees", "employee count"))
+        return {
+            "domain": self.extract_domain(website),
+            "name": name or None,
+            "website_url": website,
+            "industry": self.clean_industry(str(industry)) if industry else None,
+            "company_size": self.clean_company_size(str(size)) if size else None,
+        }
+
+    def parse_html(self, html_content: str, url: str) -> Tuple[CompanyCreateSchema, List[LeadCreateSchema]]:
+        company_info = self.extract_target_company_info(html_content, url)
+        soup = self._soup(html_content)
+        company = CompanyCreateSchema(**company_info, detected_technologies=self.detect_technologies(html_content))
+
+        leads: List[LeadCreateSchema] = []
+        source_domain = self.extract_domain(url)
+        is_directory = any(directory_domain == source_domain or source_domain.endswith(f".{directory_domain}") for directory_domain in settings.get_directory_domains())
+        for email, scope in self._lead_records(soup):
+            if is_directory and self.extract_domain(f"https://{email.rsplit('@', 1)[1]}") != company.domain:
+                continue
+            text = self._visible_text(scope)
+            first_name, last_name = self._name_from_email(email)
+            leads.append(LeadCreateSchema(
                 first_name=first_name,
                 last_name=last_name,
-                title=default_title,  # Populates lead.title designation!
+                title=self._title_from_text(text),
                 work_email=email,
-                phones=phones if idx == 0 else [],  # Associate phone batch with primary lead
-                linkedin_url=linkedin_urls[idx] if idx < len(linkedin_urls) else None
-            )
-            leads.append(lead)
-
+                phones=self._phones_in_element(scope),
+                linkedin_url=next(iter(self._linkedin_urls_in_element(scope, profile_only=True)), None),
+            ))
         return company, leads
 
     def extract_internal_links(self, html_content: str, base_url: str, max_links: int = 10) -> List[str]:
-        """
-        Parses <a href="..."> tags, isolates internal domain subpages,
-        and prioritizes high-value contact/about/team pages.
-        """
+        """Return unique crawlable same-host links, with high-value pages first."""
         domain = self.extract_domain(base_url)
-        soup = BeautifulSoup(html_content, "html.parser")
         found_links = set()
-
-        for a_tag in soup.find_all("a", href=True):
+        for a_tag in self._soup(html_content).find_all("a", href=True):
             href = a_tag["href"].strip()
             if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
                 continue
-                
             full_url = urljoin(base_url, href)
-            parsed = urlparse(full_url)
-            
-            # Must match target domain and not be root/anchor only
-            if self.extract_domain(full_url) == domain and parsed.path not in ("", "/"):
-                # Filter system paths and static file extensions (WBS 1.4)
-                if BLOCKLIST_PATH_PATTERNS.search(parsed.path):
-                    continue
-                ext = os.path.splitext(parsed.path)[1].lower()
-                if ext in BLOCKLIST_EXTENSIONS:
-                    continue
-                
-                clean_url = self.canonicalize_url(full_url)
-                if clean_url:
-                    found_links.add(clean_url)
-
-        # Issue 1 (A4): Semantic HTML link prioritization
-        # Check nav/footer containers, aria-label, itemprop, and URL keywords
-        priority_links = []
-        other_links = []
-
-        # Find all priority anchor elements in soup for semantic attribute checks
-        semantic_priority_urls = set()
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"].strip()
-            aria_label = (a_tag.get("aria-label") or "").lower()
-            title_attr = (a_tag.get("title") or "").lower()
-            rel_attr = (a_tag.get("rel") or "")
-            itemprop = (a_tag.get("itemprop") or "")
-            
-            # Check semantic HTML signals (aria-label, itemprop, rel, parent nav/footer)
-            is_semantic_priority = (
-                any(kw in aria_label for kw in PRIORITY_SUBPAGE_KEYWORDS) or
-                any(kw in title_attr for kw in PRIORITY_SUBPAGE_KEYWORDS) or
-                "author" in rel_attr or "member" in itemprop or
-                (a_tag.find_parent(["nav", "footer"]) is not None and any(kw in a_tag.get_text().lower() for kw in PRIORITY_SUBPAGE_KEYWORDS))
-            )
-            if is_semantic_priority:
-                full_url = urljoin(base_url, href)
-                clean_url = self.canonicalize_url(full_url)
-                if clean_url:
-                    semantic_priority_urls.add(clean_url)
-
-        for link in found_links:
-            if link in semantic_priority_urls or any(kw in link.lower() for kw in PRIORITY_SUBPAGE_KEYWORDS):
-                priority_links.append(link)
-            else:
-                other_links.append(link)
-
-        ordered = priority_links + other_links
-        return ordered[:max_links]
+            parsed = urlsplit(full_url)
+            if self.extract_domain(full_url) != domain or parsed.path in ("", "/"):
+                continue
+            if BLOCKLIST_PATH_PATTERNS.search(parsed.path) or os.path.splitext(parsed.path)[1].lower() in BLOCKLIST_EXTENSIONS:
+                continue
+            if clean_url := self.canonicalize_url(full_url):
+                found_links.add(clean_url)
+        return sorted(found_links, key=lambda link: (not any(keyword in link.lower() for keyword in PRIORITY_SUBPAGE_KEYWORDS), link))[:max_links]

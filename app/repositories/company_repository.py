@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import func
 from app.models.company import Company
 from app.models.technology import CompanyTechnology
 from app.schemas.company import CompanyCreateSchema
@@ -20,10 +21,10 @@ class CompanyRepository:
         ).on_conflict_do_update(
             index_elements=["domain"],
             set_={
-                "name": schema.name,
-                "website_url": schema.website_url,
-                "industry": schema.industry or Company.industry,
-                "company_size": schema.company_size or Company.company_size,
+                "name": func.coalesce(schema.name, Company.name),
+                "website_url": func.coalesce(schema.website_url, Company.website_url),
+                "industry": func.coalesce(schema.industry, Company.industry),
+                "company_size": func.coalesce(schema.company_size, Company.company_size),
                 "extra_metadata": getattr(schema, "extra_metadata", {}) or Company.extra_metadata
             }
         ).returning(Company)

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from typing import Optional, Dict, Any
 import nodriver as uc
 from app.services.scrapers.base import ScrapeResult
@@ -22,10 +23,11 @@ class Tier2CDPScraper:
     ) -> ScrapeResult:
         browser = None
         try:
-            logger.info(f"Launching nodriver Chrome instance (headless={self.headless})...")
-            logger.info(f"Browser process PID: {browser.config.process.pid}")
+            # Linux/WSL containers do not have a display server.
+            effective_headless = self.headless if sys.platform == "win32" else True
+            logger.info(f"Launching nodriver Chrome instance (headless={effective_headless})...")
             browser = await uc.start(
-                headless=self.headless,
+                headless=effective_headless,
                 browser_args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
@@ -35,6 +37,8 @@ class Tier2CDPScraper:
                     "--blink-settings=imagesEnabled=false",  # Block images to save bandwidth
                 ]
             )
+            if getattr(getattr(browser, "config", None), "process", None):
+                logger.info("Browser process PID: %s", browser.config.process.pid)
             
             logger.info(f"Navigating via WebSocket CDP to: {url}")
             page = await browser.get(url)

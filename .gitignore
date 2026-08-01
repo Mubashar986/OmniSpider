@@ -16,6 +16,12 @@ __pycache__/
 *$py.class
 *.so
 
+# Runtime output and scraped data (never commit lead data or local agent state)
+.omx/
+logs/
+exports/
+test-monitor.log
+
 # Database Migrations & Alembic
 !alembic/
 !alembic/versions/

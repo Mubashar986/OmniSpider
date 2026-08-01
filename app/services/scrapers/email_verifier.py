@@ -1,10 +1,12 @@
 import re
 import logging
+import json
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import dns.resolver
 
-from app.core.config import settings
+from app.core.redis import get_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,8 @@ DISPOSABLE_DOMAINS = {
     "trashmail.com", "yopmail.com", "getnada.com", "throwawaymail.com",
     "sharklasers.com", "dispostable.com", "temp-mail.org", "fakeinbox.com"
 }
+MX_CACHE_TTL_SECONDS = 24 * 60 * 60
+SHARED_CACHE_RETRY_SECONDS = 60
 
 @dataclass
 class EmailVerificationResult:
@@ -35,7 +39,8 @@ class EmailVerifierService:
     """
     def __init__(self, dns_timeout: float = 3.0):
         self.dns_timeout = dns_timeout
-        self._mx_cache: Dict[str, List[str]] = {}
+        self._mx_cache: Dict[str, Tuple[float, List[str]]] = {}
+        self._shared_cache_retry_at = 0.0
 
     def is_syntax_valid(self, email: str) -> bool:
         if not email or not isinstance(email, str):
@@ -47,49 +52,54 @@ class EmailVerifierService:
 
     def get_mx_records(self, domain: str) -> List[str]:
         domain_clean = domain.lower().strip()
-        
-        # Tier 1: Process-local in-memory cache
-        if domain_clean in self._mx_cache:
-            return self._mx_cache[domain_clean]
+        now = time.monotonic()
+        cached = self._mx_cache.get(domain_clean)
+        if cached and cached[0] > now:
+            return cached[1]
+        self._mx_cache.pop(domain_clean, None)
 
-        # Tier 2: Redis shared cache (Issue 22 Fix)
-        try:
-            from app.core.redis import get_redis_client
-            import json
-            r = get_redis_client()
-            cached_val = r.get(f"mx:{domain_clean}")
-            if cached_val:
-                mx_hosts = json.loads(cached_val)
-                self._mx_cache[domain_clean] = mx_hosts
-                return mx_hosts
-        except Exception:
-            pass  # Fallback to direct DNS lookup if Redis unavailable
+        cache_key = f"mx:{domain_clean}"
+        if now >= self._shared_cache_retry_at:
+            try:
+                redis_value = get_redis_client().get(cache_key)
+                if redis_value is not None:
+                    records = json.loads(redis_value)
+                    if isinstance(records, list) and all(isinstance(record, str) for record in records):
+                        self._mx_cache[domain_clean] = (now + MX_CACHE_TTL_SECONDS, records)
+                        return records
+            except Exception as cache_error:
+                # A down Redis instance must not add its connection timeout to every lead.
+                self._shared_cache_retry_at = now + SHARED_CACHE_RETRY_SECONDS
+                logger.debug("Shared MX cache unavailable for %s: %s", domain_clean, cache_error)
 
-        # Tier 3: Direct DNS lookup
         try:
             resolver = dns.resolver.Resolver()
-            resolver.nameservers = settings.get_dns_servers()
             resolver.lifetime = self.dns_timeout
             resolver.timeout = self.dns_timeout
             
             answers = resolver.resolve(domain_clean, 'MX')
             mx_hosts = [str(r.exchange).rstrip('.') for r in answers]
-            self._mx_cache[domain_clean] = mx_hosts
-
-            # Write back to Redis shared cache with 24h TTL (86400s)
-            try:
-                from app.core.redis import get_redis_client
-                import json
-                r = get_redis_client()
-                r.setex(f"mx:{domain_clean}", 86400, json.dumps(mx_hosts))
-            except Exception:
-                pass
-
+            self._store_mx_cache(domain_clean, mx_hosts, now)
             return mx_hosts
-        except Exception as e:
-            logger.debug(f"DNS MX Lookup failed for domain {domain_clean}: {e}")
-            self._mx_cache[domain_clean] = []
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer) as error:
+            logger.debug("No MX records for domain %s: %s", domain_clean, error)
+            self._store_mx_cache(domain_clean, [], now)
             return []
+        except Exception as error:
+            # Do not cache resolver outages: a future lead deserves a retry.
+            logger.debug("DNS MX lookup failed for domain %s: %s", domain_clean, error)
+            return []
+
+    def _store_mx_cache(self, domain: str, records: List[str], now: Optional[float] = None) -> None:
+        self._mx_cache[domain] = ((now if now is not None else time.monotonic()) + MX_CACHE_TTL_SECONDS, records)
+        current_time = now if now is not None else time.monotonic()
+        if current_time < self._shared_cache_retry_at:
+            return
+        try:
+            get_redis_client().setex(f"mx:{domain}", MX_CACHE_TTL_SECONDS, json.dumps(records))
+        except Exception as cache_error:
+            self._shared_cache_retry_at = current_time + SHARED_CACHE_RETRY_SECONDS
+            logger.debug("Could not store shared MX cache for %s: %s", domain, cache_error)
 
     def verify_email(self, email: str) -> EmailVerificationResult:
         email_clean = email.strip() if email else ""
