@@ -17,9 +17,10 @@ __pycache__/
 *.so
 
 # Database Migrations & Alembic
-alembic/
-alembic.ini
-migrations/
+!alembic/
+!alembic/versions/
+alembic/__pycache__/
+alembic/versions/__pycache__/
 
 # Skills & Agent Artifacts
 skills/
