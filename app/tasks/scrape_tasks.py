@@ -27,7 +27,7 @@ lead_repo = LeadRepository()
 scrape_log_repo = ScrapeLogRepository()
 
 @celery_app.task(name="tasks.scrape_url_task", bind=True)
-def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_depth: int = 0, enable_cooldown: bool = False, session_id: Optional[str] = None) -> Dict[str, Any]:
+def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_depth: int = 0, enable_cooldown: bool = False, force_refresh: bool = False, max_links: Optional[int] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Complete End-to-End Celery Scraping Pipeline:
     1. Tier 1 HTTP Scrape (curl_cffi)
@@ -47,7 +47,7 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
     try:
         # 1. Optional Frequency Control Check (Disabled by default; only active if enable_cooldown=True)
         cooldown_days = settings.SCRAPE_COOLDOWN_DAYS
-        if enable_cooldown and cooldown_days > 0 and scrape_log_repo.was_scraped_recently(db, url, days=cooldown_days):
+        if enable_cooldown and not force_refresh and cooldown_days > 0 and scrape_log_repo.was_scraped_recently(db, url, days=cooldown_days):
             logger.info(f"[Task {task_id}] URL '{url}' was scraped within last {cooldown_days} days. Skipping fetch.")
             return {
                 "status": "skipped",
@@ -56,6 +56,9 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
                 "url": url,
                 "session_id": session_id
             }
+
+        # Issue 17: Update progress state (FETCHING)
+        self.update_state(state="PROGRESS", meta={"step": "fetching", "url": url, "session_id": session_id})
 
         # 2. Scrape Page (Tier 1 -> Tier 2 Fallback)
         scrape_result = None
@@ -90,6 +93,7 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
             }
 
         # 3. Parse HTML & Extract Structured Schemas
+        self.update_state(state="PROGRESS", meta={"step": "parsing", "url": url, "session_id": session_id})
         company_schema, lead_schemas = parser_service.parse_html(scrape_result.html_content, url)
 
         # 4. Save Company & Technographics to PostgreSQL
@@ -97,6 +101,7 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
         logger.info(f"[Task {task_id}] Saved Company: {company.name} (ID: {company.id})")
 
         # 5. Verify Emails & Save Leads to PostgreSQL
+        self.update_state(state="PROGRESS", meta={"step": "verifying", "leads_found": len(lead_schemas), "session_id": session_id})
         saved_leads_count = 0
         for lead_schema in lead_schemas:
             # Perform Email Verification
@@ -112,7 +117,8 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
         # 6. Recursive Subpage Crawling Dispatch with Session Deduplication (WBS 1.1)
         dispatched_subpages = []
         if crawl_depth > 0:
-            internal_links = parser_service.extract_internal_links(scrape_result.html_content, url, max_links=15)
+            effective_max_links = max_links or settings.MAX_LINKS_PER_PAGE
+            internal_links = parser_service.extract_internal_links(scrape_result.html_content, url, max_links=effective_max_links)
             logger.info(f"[Task {task_id}] Discovered {len(internal_links)} internal subpages. Applying Redis SADD dedup check...")
             
             try:
@@ -140,6 +146,8 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
                             "force_tier": force_tier,
                             "crawl_depth": crawl_depth - 1,
                             "enable_cooldown": enable_cooldown,
+                            "force_refresh": force_refresh,
+                            "max_links": max_links,
                             "session_id": session_id,
                         },
                         task_id=child_task_id
@@ -148,7 +156,7 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
             except Exception as red_err:
                 logger.warning(f"[Task {task_id}] Redis dedup check error ({red_err}); falling back to direct dispatch.")
                 for sub_url in internal_links:
-                    scrape_url_task.delay(sub_url, force_tier=force_tier, crawl_depth=crawl_depth - 1, enable_cooldown=enable_cooldown, session_id=session_id)
+                    scrape_url_task.delay(sub_url, force_tier=force_tier, crawl_depth=crawl_depth - 1, enable_cooldown=enable_cooldown, force_refresh=force_refresh, max_links=max_links, session_id=session_id)
                     dispatched_subpages.append(sub_url)
 
         return {

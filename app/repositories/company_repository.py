@@ -13,12 +13,18 @@ class CompanyRepository:
         stmt = pg_insert(Company).values(
             domain=schema.domain,
             name=schema.name,
-            website_url=schema.website_url
+            website_url=schema.website_url,
+            industry=schema.industry,
+            company_size=schema.company_size,
+            extra_metadata=getattr(schema, "extra_metadata", {})
         ).on_conflict_do_update(
             index_elements=["domain"],
             set_={
                 "name": schema.name,
                 "website_url": schema.website_url,
+                "industry": schema.industry or Company.industry,
+                "company_size": schema.company_size or Company.company_size,
+                "extra_metadata": getattr(schema, "extra_metadata", {}) or Company.extra_metadata
             }
         ).returning(Company)
         

@@ -10,3 +10,7 @@ nodriver>=0.30
 dnspython>=2.6.1
 python-dotenv>=1.0.1
 beautifulsoup4>=4.12.3
+phonenumbers>=8.13.0
+tldextract>=5.1.0
+email-validator>=2.1.0
+yarl>=1.9.0

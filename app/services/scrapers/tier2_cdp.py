@@ -17,18 +17,15 @@ class Tier2CDPScraper:
     async def fetch_page_async(
         self,
         url: str,
-        timeout: int = 30,
-        wait_for_seconds: int = 4
+        timeout: int = 40,
+        wait_for_seconds: int = 10
     ) -> ScrapeResult:
         browser = None
         try:
-            import sys
-            # Enforce headless mode on Linux/WSL since no GUI display server is available
-            effective_headless = True if sys.platform != "win32" else self.headless
-
-            logger.info(f"Launching nodriver Chrome instance (headless={effective_headless})...")
+            logger.info(f"Launching nodriver Chrome instance (headless={self.headless})...")
+            logger.info(f"Browser process PID: {browser.config.process.pid}")
             browser = await uc.start(
-                headless=effective_headless,
+                headless=self.headless,
                 browser_args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
@@ -42,8 +39,19 @@ class Tier2CDPScraper:
             logger.info(f"Navigating via WebSocket CDP to: {url}")
             page = await browser.get(url)
             
-            # Allow time for JS execution / Turnstile verification
-            await asyncio.sleep(wait_for_seconds)
+            # Issue 20: Adaptive readyState polling loop (fast on simple pages, patient on SPAs)
+            poll_interval = 0.5
+            max_polls = int(wait_for_seconds / poll_interval)
+            for _ in range(max_polls):
+                try:
+                    ready_state = await page.evaluate("document.readyState")
+                    if ready_state == "complete":
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(poll_interval)
+
+
             
             # Extract rendered HTML content
             html_content = await page.get_content()

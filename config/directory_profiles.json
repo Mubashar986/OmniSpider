@@ -1,0 +1,27 @@
+{
+  "clutch.co": {
+    "profile_paths": ["/profile/"],
+    "company_name_selector": "h1.header-company_name",
+    "industry_selector": "div.field-service"
+  },
+  "goodfirms.co": {
+    "profile_paths": ["/company/"],
+    "company_name_selector": "h1.main-title",
+    "industry_selector": "div.category-name"
+  },
+  "designrush.com": {
+    "profile_paths": ["/agency/"],
+    "company_name_selector": "h1",
+    "industry_selector": "span.specialization"
+  },
+  "upcity.com": {
+    "profile_paths": ["/firm/", "/local-marketing-agencies/"],
+    "company_name_selector": "h1",
+    "industry_selector": "div.industry"
+  },
+  "g2.com": {
+    "profile_paths": ["/products/"],
+    "company_name_selector": "h1",
+    "industry_selector": "div.category-name"
+  }
+}

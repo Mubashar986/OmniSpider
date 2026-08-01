@@ -1,0 +1,9 @@
+{
+  "company_name": ["name", "legalName", "alternateName"],
+  "company_size": ["numberOfEmployees", "employees", "employeeCount", "staff", "size", "headcount", "member"],
+  "industry": ["knowsAbout", "genre", "industry", "sector", "category", "specialization"],
+  "website": ["url", "sameAs", "mainEntityOfPage"],
+  "description": ["description", "about", "summary"],
+  "founded_year": ["foundingDate", "dateCreated"],
+  "headquarters": ["address", "location", "areaServed"]
+}

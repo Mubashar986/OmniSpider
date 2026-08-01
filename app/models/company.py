@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 from sqlalchemy import String, Text, DateTime, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base
 
@@ -15,6 +15,7 @@ class Company(Base):
     industry: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     company_size: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     website_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    extra_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, default={}, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

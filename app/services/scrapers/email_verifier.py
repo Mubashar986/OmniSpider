@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 import dns.resolver
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Standard RFC 5322 Email Regex
@@ -45,17 +47,44 @@ class EmailVerifierService:
 
     def get_mx_records(self, domain: str) -> List[str]:
         domain_clean = domain.lower().strip()
+        
+        # Tier 1: Process-local in-memory cache
         if domain_clean in self._mx_cache:
             return self._mx_cache[domain_clean]
 
+        # Tier 2: Redis shared cache (Issue 22 Fix)
+        try:
+            from app.core.redis import get_redis_client
+            import json
+            r = get_redis_client()
+            cached_val = r.get(f"mx:{domain_clean}")
+            if cached_val:
+                mx_hosts = json.loads(cached_val)
+                self._mx_cache[domain_clean] = mx_hosts
+                return mx_hosts
+        except Exception:
+            pass  # Fallback to direct DNS lookup if Redis unavailable
+
+        # Tier 3: Direct DNS lookup
         try:
             resolver = dns.resolver.Resolver()
+            resolver.nameservers = settings.get_dns_servers()
             resolver.lifetime = self.dns_timeout
             resolver.timeout = self.dns_timeout
             
             answers = resolver.resolve(domain_clean, 'MX')
             mx_hosts = [str(r.exchange).rstrip('.') for r in answers]
             self._mx_cache[domain_clean] = mx_hosts
+
+            # Write back to Redis shared cache with 24h TTL (86400s)
+            try:
+                from app.core.redis import get_redis_client
+                import json
+                r = get_redis_client()
+                r.setex(f"mx:{domain_clean}", 86400, json.dumps(mx_hosts))
+            except Exception:
+                pass
+
             return mx_hosts
         except Exception as e:
             logger.debug(f"DNS MX Lookup failed for domain {domain_clean}: {e}")
