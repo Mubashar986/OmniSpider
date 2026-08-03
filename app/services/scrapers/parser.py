@@ -3,12 +3,16 @@ import logging
 import os
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+import phonenumbers
 import tldextract
+from bs4 import BeautifulSoup, NavigableString, Tag
+from nameparser import HumanName
+from phonenumbers import PhoneNumberType
 
 from app.core.config import settings
 from app.schemas.company import CompanyCreateSchema
@@ -40,11 +44,13 @@ BLOCKLIST_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp"
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}")
 LINKEDIN_REGEX = re.compile(r"https?://(?:[a-z]{2,3}\.)?(?:www\.)?linkedin\.com/(?:company|in)/[a-zA-Z0-9_-]+/?", re.IGNORECASE)
+TWITTER_REGEX = re.compile(r"https?://(?:www\.)?(?:twitter\.com|x\.com)/([a-zA-Z0-9_]{2,15})/?(?:[?#][^\s\"']*)?", re.IGNORECASE)
 
 FREE_EMAIL_DOMAINS = {
     "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "hotmail.com",
     "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "aol.com",
-    "proton.me", "protonmail.com", "gmx.com", "mail.com",
+    "proton.me", "protonmail.com", "gmx.com", "gmx.net", "mail.com",
+    "seznam.cz", "web.de", "yandex.com", "zoho.com",
 }
 PLACEHOLDER_EMAILS = {
     "you@work.com", "name@domain.com", "email@example.com", "user@example.com",
@@ -55,35 +61,95 @@ SOCIAL_OR_UTILITY_DOMAINS = {
     "youtube.com", "tiktok.com", "pinterest.com", "wa.me", "whatsapp.com",
     "google.com", "maps.google.com", "apple.com", "play.google.com",
 }
+TWITTER_RESERVED_SLUGS = {"share", "intent", "home", "hashtag", "search", "i", "explore", "settings"}
 CONTACT_SCOPE_TAGS = {"article", "li", "tr", "section", "address", "figure", "div", "p"}
+MAX_PHONES_PER_SCOPE = 3
+MAX_PERSONS_PER_PAGE = 25
 TITLE_PATTERN = re.compile(
     r"\b(?:chief\s+(?:executive|technology|operating|financial|marketing|revenue)\s+officer|"
     r"ceo|cto|coo|cfo|cmo|founder|co-?founder|president|vice\s+president|vp|"
     r"director|manager|partner|owner|head\s+of\s+[a-z ]+)\b",
     re.IGNORECASE,
 )
+NAME_STOPWORDS = {
+    "our", "team", "about", "contact", "leadership", "management", "company", "the",
+    "and", "meet", "join", "work", "careers", "services", "service", "home", "blog",
+    "get", "started", "learn", "more", "privacy", "terms", "why", "how", "what",
+    "who", "we", "are", "us", "your", "their", "his", "her", "all", "view", "read",
+    "story", "stories", "values", "mission", "vision", "news", "press", "faq",
+}
 
 DEFAULT_TECH_SIGNATURES = {
-    "Next.js": [r"_next/static", r"__NEXT_DATA__"],
-    "React": [r"react\.production\.min\.js", r"react-dom"],
-    "Vue.js": [r"vue\.global\.js", r"v-attr"],
-    "WordPress": [r"wp-content", r"wp-includes"],
-    "Shopify": [r"cdn\.shopify\.com", r"Shopify\.theme"],
-    "Cloudflare": [r"cloudflare\.com", r"__cf_chl_opt"],
-    "Google Analytics": [r"googletagmanager\.com", r"gtag"],
-    "Tailwind CSS": [r"tailwind", r"tw-"],
-    "Bootstrap": [r"bootstrap\.min\.css"],
-    "HubSpot": [r"js\.hs-scripts\.com", r"hubspot"],
-    "Stripe": [r"js\.stripe\.com"],
+    "Next.js": {"category": "Framework", "patterns": [r"_next/static", r"__NEXT_DATA__"]},
+    "React": {"category": "Framework", "patterns": [r"react\.production\.min\.js", r"react-dom"]},
+    "Vue.js": {"category": "Framework", "patterns": [r"vue\.global\.js", r"v-attr"]},
+    "WordPress": {"category": "CMS", "patterns": [r"wp-content", r"wp-includes"]},
+    "Shopify": {"category": "Ecommerce", "patterns": [r"cdn\.shopify\.com", r"Shopify\.theme"]},
+    "Cloudflare": {"category": "CDN & Security", "patterns": [r"cloudflare\.com", r"__cf_chl_opt"]},
+    "Google Analytics": {"category": "Analytics", "patterns": [r"googletagmanager\.com", r"gtag"]},
+    "Tailwind CSS": {"category": "CSS", "patterns": [r"tailwind", r"tw-"]},
+    "Bootstrap": {"category": "CSS", "patterns": [r"bootstrap\.min\.css"]},
+    "HubSpot": {"category": "Marketing", "patterns": [r"js\.hs-scripts\.com", r"hubspot"]},
+    "Stripe": {"category": "Payments", "patterns": [r"js\.stripe\.com"]},
 }
-TECH_SIGNATURES = _load_json_config("tech_signatures.json") or DEFAULT_TECH_SIGNATURES
+
+
+def _load_tech_signatures() -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+    """Load signatures supporting both legacy list format and categorized dict format."""
+    raw = _load_json_config("tech_signatures.json") or DEFAULT_TECH_SIGNATURES
+    patterns: Dict[str, List[str]] = {}
+    categories: Dict[str, str] = {}
+    for tech_name, spec in raw.items():
+        if isinstance(spec, dict):
+            patterns[tech_name] = [str(pattern) for pattern in spec.get("patterns", [])]
+            categories[tech_name] = str(spec.get("category") or "Detected Stack")
+        elif isinstance(spec, list):
+            patterns[tech_name] = [str(pattern) for pattern in spec]
+            categories[tech_name] = "Detected Stack"
+    return patterns, categories
+
+
+TECH_SIGNATURES, TECH_CATEGORY_MAP = _load_tech_signatures()
 FIELD_MAPPINGS = _load_json_config("field_mappings.json")
 DIRECTORY_PROFILES = _load_json_config("directory_profiles.json")
+
+
+class PageType:
+    """Routing decision for a fetched page: which extraction strategy applies."""
+    DIRECTORY_LISTING = "directory_listing"
+    DIRECTORY_PROFILE = "directory_profile"
+    COMPANY_SITE = "company_site"
+
+
+@dataclass
+class PersonRecord:
+    """A decision-maker discovered on a company site, with email candidates to verify."""
+    first_name: str
+    last_name: str
+    title: Optional[str] = None
+    seniority: Optional[str] = None
+    department: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    candidate_emails: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ParsedPage:
+    """Router-aware parse result consumed by the Celery pipeline."""
+    page_type: str
+    company: Optional[CompanyCreateSchema] = None
+    leads: List[LeadCreateSchema] = field(default_factory=list)
+    profile_links: List[str] = field(default_factory=list)
+    target_website: Optional[str] = None
+    persons: List[PersonRecord] = field(default_factory=list)
 
 
 class HTMLParserService:
     """Extract company and contact data without crossing DOM-card boundaries."""
 
+    # ------------------------------------------------------------------
+    # URL helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def extract_domain(url: str) -> str:
         """Return a normalized host, including correct handling of ports and IPv6."""
@@ -91,6 +157,11 @@ class HTMLParserService:
             return ""
         parsed = urlsplit(url if "://" in url else f"//{url}")
         return (parsed.hostname or "").lower().removeprefix("www.")
+
+    @staticmethod
+    def _registered_domain(host: str) -> str:
+        extracted = tldextract.extract(host or "")
+        return ".".join(part for part in (extracted.domain, extracted.suffix) if part)
 
     @staticmethod
     def canonicalize_url(url: str) -> str:
@@ -132,6 +203,59 @@ class HTMLParserService:
         parts = full_name.strip().split() if full_name else []
         return (parts[0], " ".join(parts[1:]) or None) if parts else (None, None)
 
+    # ------------------------------------------------------------------
+    # Page classification & listing harvest (two-hop pipeline, WBS P0-B)
+    # ------------------------------------------------------------------
+    @classmethod
+    def _directory_profile_paths(cls, domain: str) -> List[str]:
+        profile = DIRECTORY_PROFILES.get(domain, {})
+        if not isinstance(profile, dict):
+            return []
+        return [str(path).lower() for path in profile.get("profile_paths", [])]
+
+    @classmethod
+    def classify_page(cls, url: str) -> str:
+        """Decide which extraction strategy applies to a URL."""
+        domain = cls.extract_domain(url)
+        path = urlsplit(url if "://" in url else f"//{url}").path.lower()
+        directory_domains = settings.get_directory_domains()
+        is_directory = any(domain == d or domain.endswith(f".{d}") for d in directory_domains)
+        if not is_directory:
+            return PageType.COMPANY_SITE
+        for directory_domain in directory_domains:
+            if domain == directory_domain or domain.endswith(f".{directory_domain}"):
+                if any(profile_path in path for profile_path in cls._directory_profile_paths(directory_domain)):
+                    return PageType.DIRECTORY_PROFILE
+        return PageType.DIRECTORY_LISTING
+
+    def extract_profile_links(self, html_content: str, base_url: str, max_links: int = 25) -> List[str]:
+        """Harvest directory profile links from a listing page (the only links worth crawling there)."""
+        domain = self.extract_domain(base_url)
+        profile_paths: Set[str] = set()
+        for directory_domain in settings.get_directory_domains():
+            if domain == directory_domain or domain.endswith(f".{directory_domain}"):
+                profile_paths.update(self._directory_profile_paths(directory_domain))
+        if not profile_paths:
+            return []
+        self_url = self.canonicalize_url(base_url)
+        found: Set[str] = set()
+        for a_tag in self._soup(html_content).find_all("a", href=True):
+            href = a_tag["href"].strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            full_url = urljoin(base_url, href)
+            if self.extract_domain(full_url) != domain:
+                continue
+            if not any(profile_path in urlsplit(full_url).path.lower() for profile_path in profile_paths):
+                continue
+            clean_url = self.canonicalize_url(full_url)
+            if clean_url and clean_url != self_url:
+                found.add(clean_url)
+        return sorted(found)[:max_links]
+
+    # ------------------------------------------------------------------
+    # Soup & text helpers
+    # ------------------------------------------------------------------
     @staticmethod
     def _soup(html: str) -> BeautifulSoup:
         soup = BeautifulSoup(html or "", "html.parser")
@@ -149,6 +273,9 @@ class HTMLParserService:
             if text.strip() and text.parent and text.parent.name not in {"script", "style", "template", "noscript"}
         )
 
+    # ------------------------------------------------------------------
+    # Email extraction
+    # ------------------------------------------------------------------
     @staticmethod
     def _clean_email(value: str) -> Optional[str]:
         email = value.strip().lower().strip("<>[](){}.,;:'\"")
@@ -189,9 +316,25 @@ class HTMLParserService:
         """Extract only visible, non-placeholder business email addresses."""
         return self._emails_in_element(self._soup(html))
 
+    # ------------------------------------------------------------------
+    # Phone extraction (context-scoped, junk-filtered, phonenumbers-typed)
+    # ------------------------------------------------------------------
     @staticmethod
     def _normalise_phone(value: str) -> str:
         return re.sub(r"\s+", " ", value).strip(" .,-")
+
+    @staticmethod
+    def _classify_phone(number: str) -> str:
+        try:
+            parsed = phonenumbers.parse(number, settings.PHONE_DEFAULT_REGION)
+            number_type = phonenumbers.number_type(parsed)
+            if number_type in (PhoneNumberType.MOBILE, PhoneNumberType.VOIP, PhoneNumberType.PAGER):
+                return "mobile"
+            if number_type in (PhoneNumberType.TOLL_FREE, PhoneNumberType.SHARED_COST):
+                return "toll_free"
+        except phonenumbers.NumberParseException:
+            pass
+        return "mobile" if number.startswith("+") else "office"
 
     @classmethod
     def _phones_in_element(cls, element: Tag) -> List[PhoneSchema]:
@@ -202,15 +345,23 @@ class HTMLParserService:
         for candidate in candidates:
             number = cls._normalise_phone(candidate)
             key = re.sub(r"\D", "", number)
-            if len(key) < 10 or key in seen:
+            # Tracking IDs and timestamps are typically 13+ digits and never carry a '+'.
+            if len(key) < 10 or len(key) > 15 or (len(key) > 12 and not number.startswith("+")) or key in seen:
+                continue
+            if len(set(key)) == 1:  # 0000000000-style junk
                 continue
             seen.add(key)
-            phones.append(PhoneSchema(number=number, type="mobile" if number.startswith("+") else "office"))
+            phones.append(PhoneSchema(number=number, type=cls._classify_phone(number)))
+            if len(phones) >= MAX_PHONES_PER_SCOPE:
+                break
         return phones
 
     def extract_phones(self, html: str) -> List[PhoneSchema]:
         return self._phones_in_element(self._soup(html))
 
+    # ------------------------------------------------------------------
+    # Social links
+    # ------------------------------------------------------------------
     @staticmethod
     def _linkedin_urls_in_element(element: Tag, profile_only: bool = False) -> List[str]:
         urls = []
@@ -225,9 +376,35 @@ class HTMLParserService:
     def extract_linkedin_urls(self, html: str) -> List[str]:
         return self._linkedin_urls_in_element(self._soup(html))
 
-    def detect_technologies(self, html: str) -> List[str]:
-        return [tech for tech, patterns in TECH_SIGNATURES.items() if any(re.search(pattern, html, re.IGNORECASE) for pattern in patterns)]
+    @classmethod
+    def _extract_socials(cls, element: Tag) -> Tuple[Optional[str], Optional[str]]:
+        """Company-level LinkedIn (/company/) and Twitter/X handle URL."""
+        linkedin = next((url for url in cls._linkedin_urls_in_element(element) if "/company/" in url.lower()), None)
+        twitter = None
+        for link in element.find_all("a", href=True):
+            match = TWITTER_REGEX.search(link["href"])
+            if match and match.group(1).lower() not in TWITTER_RESERVED_SLUGS:
+                twitter = match.group(0).split("?", 1)[0].split("#", 1)[0].rstrip("/")
+                break
+        return linkedin, twitter
 
+    # ------------------------------------------------------------------
+    # Technographics (categorized)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _detect_tech_map(html: str) -> Dict[str, str]:
+        return {
+            tech: TECH_CATEGORY_MAP.get(tech, "Detected Stack")
+            for tech, patterns in TECH_SIGNATURES.items()
+            if any(re.search(pattern, html, re.IGNORECASE) for pattern in patterns)
+        }
+
+    def detect_technologies(self, html: str) -> List[str]:
+        return list(self._detect_tech_map(html))
+
+    # ------------------------------------------------------------------
+    # Contact scoping & lead records
+    # ------------------------------------------------------------------
     @classmethod
     def _contact_scope(cls, source: Tag) -> Tag:
         """Find the closest meaningful card that does not contain many contacts."""
@@ -258,6 +435,38 @@ class HTMLParserService:
         match = TITLE_PATTERN.search(text)
         return re.sub(r"\s+", " ", match.group(0)).title() if match else None
 
+    @staticmethod
+    def _seniority_from_title(title: Optional[str]) -> Optional[str]:
+        if not title:
+            return None
+        lowered = title.lower()
+        if re.search(r"chief|c[eoifoatm]o\b|founder|president|owner|partner|managing\s+director", lowered):
+            return "c_level"
+        if re.search(r"\bvp\b|vice\s+president", lowered):
+            return "vp"
+        if re.search(r"director|head\s+of", lowered):
+            return "director"
+        if re.search(r"manager|lead\b|supervisor", lowered):
+            return "manager"
+        return "individual_contributor"
+
+    @staticmethod
+    def _department_from_title(title: Optional[str]) -> Optional[str]:
+        if not title:
+            return None
+        lowered = title.lower()
+        for keyword, department in (
+            ("engineer", "Engineering"), ("developer", "Engineering"), ("tech", "Engineering"),
+            ("product", "Product"), ("design", "Design"), ("data", "Data"),
+            ("sales", "Sales"), ("revenue", "Sales"), ("marketing", "Marketing"),
+            ("growth", "Marketing"), ("finance", "Finance"), ("accounting", "Finance"),
+            ("hr", "HR"), ("human resources", "HR"), ("people", "HR"),
+            ("operations", "Operations"), ("support", "Support"), ("legal", "Legal"),
+        ):
+            if keyword in lowered:
+                return department
+        return None
+
     def _lead_records(self, soup: BeautifulSoup) -> Iterable[Tuple[str, Tag]]:
         """Yield each email once with its smallest useful DOM scope, in document order."""
         records: Dict[str, Tag] = {}
@@ -277,6 +486,32 @@ class HTMLParserService:
                     records[email] = scope
         return records.items()
 
+    def _extract_leads(self, soup: BeautifulSoup, allowed_domain: str) -> List[LeadCreateSchema]:
+        """Card-scoped lead extraction guarded to emails on the allowed registered domain."""
+        allowed_registered = self._registered_domain(allowed_domain)
+        leads: List[LeadCreateSchema] = []
+        for email, scope in self._lead_records(soup):
+            email_domain = email.rsplit("@", 1)[1]
+            if allowed_registered and self._registered_domain(email_domain) != allowed_registered:
+                continue
+            text = self._visible_text(scope)
+            first_name, last_name = self._name_from_email(email)
+            title = self._title_from_text(text)
+            leads.append(LeadCreateSchema(
+                first_name=first_name,
+                last_name=last_name,
+                title=title,
+                seniority=self._seniority_from_title(title),
+                department=self._department_from_title(title),
+                work_email=email,
+                phones=self._phones_in_element(scope),
+                linkedin_url=next(iter(self._linkedin_urls_in_element(scope, profile_only=True)), None),
+            ))
+        return leads
+
+    # ------------------------------------------------------------------
+    # Directory profile target-company extraction
+    # ------------------------------------------------------------------
     @staticmethod
     def _unwrap_redirect(url: str) -> str:
         parsed = urlsplit(url)
@@ -327,8 +562,8 @@ class HTMLParserService:
         normalized = re.sub(r"\s+", " ", value).strip()
         if not re.search(r"\b(?:employees?|staff|team|people|personnel)\b", normalized, re.IGNORECASE):
             return None
-        match = re.search(r"(?<!\d)(\d+\s*(?:[-\u2013]|to)\s*\d+|\d+\s*\+?)(?!\d)", normalized)
-        return re.sub(r"\s+", "", match.group(1)).replace("\u2013", "-") if match else None
+        match = re.search(r"(?<!\d)(\d+\s*(?:[-–]|to)\s*\d+|\d+\s*\+?)(?!\d)", normalized)
+        return re.sub(r"\s+", "", match.group(1)).replace("–", "-") if match else None
 
     @staticmethod
     def clean_industry(value: Optional[str]) -> Optional[str]:
@@ -389,6 +624,26 @@ class HTMLParserService:
         keys = mapping if isinstance(mapping, list) else defaults
         return next((record[key] for key in keys if record.get(key)), None)
 
+    @staticmethod
+    def _json_ld_extra_metadata(best_org: Dict[str, object]) -> Dict[str, object]:
+        """Long-tail company facts that have no dedicated column live in extra_metadata."""
+        metadata: Dict[str, object] = {}
+        if not best_org:
+            return metadata
+        description = HTMLParserService._mapped_value(best_org, "description", ("description", "about", "summary"))
+        if description:
+            metadata["description"] = str(description)[:1000]
+        founded = HTMLParserService._mapped_value(best_org, "founded_year", ("foundingDate", "dateCreated"))
+        if founded:
+            metadata["founded_year"] = str(founded)[:10]
+        headquarters = HTMLParserService._mapped_value(best_org, "headquarters", ("address", "location", "areaServed"))
+        if isinstance(headquarters, dict):
+            parts = [headquarters.get(key) for key in ("addressLocality", "addressRegion", "addressCountry")]
+            headquarters = ", ".join(str(part) for part in parts if part)
+        if headquarters:
+            metadata["headquarters"] = str(headquarters)[:200]
+        return metadata
+
     def extract_target_company_info(self, html_content: str, page_url: str) -> Dict[str, Optional[str]]:
         """Extract directory-aware company metadata and a safely canonicalized website."""
         soup = self._soup(html_content)
@@ -424,37 +679,188 @@ class HTMLParserService:
         if isinstance(size, dict):
             size = size.get("value") or size.get("minValue")
         size = size or self._labelled_value(soup, ("company size", "team size", "employees", "employee count"))
+
+        # Socials scoped to the company-name block so directory footer socials never leak in.
+        social_scope: Tag = h1.parent if h1 and isinstance(h1.parent, Tag) else soup
+        linkedin_url, twitter_url = self._extract_socials(social_scope)
+
         return {
             "domain": self.extract_domain(website),
             "name": name or None,
             "website_url": website,
             "industry": self.clean_industry(str(industry)) if industry else None,
             "company_size": self.clean_company_size(str(size)) if size else None,
+            "linkedin_url": linkedin_url,
+            "twitter_url": twitter_url,
+            "extra_metadata": self._json_ld_extra_metadata(best_org),
         }
 
-    def parse_html(self, html_content: str, url: str) -> Tuple[CompanyCreateSchema, List[LeadCreateSchema]]:
-        company_info = self.extract_target_company_info(html_content, url)
-        soup = self._soup(html_content)
-        company = CompanyCreateSchema(**company_info, detected_technologies=self.detect_technologies(html_content))
+    # ------------------------------------------------------------------
+    # Company-site extraction (second hop: the company's own website)
+    # ------------------------------------------------------------------
+    def _company_site_info(self, soup: BeautifulSoup, url: str) -> Dict[str, Optional[str]]:
+        page_domain = self.extract_domain(url)
+        orgs = self._json_ld_organizations(soup, page_domain)
+        best_org = max(orgs, key=lambda item: item[0])[1] if orgs else {}
 
-        leads: List[LeadCreateSchema] = []
-        source_domain = self.extract_domain(url)
-        is_directory = any(directory_domain == source_domain or source_domain.endswith(f".{directory_domain}") for directory_domain in settings.get_directory_domains())
-        for email, scope in self._lead_records(soup):
-            if is_directory and self.extract_domain(f"https://{email.rsplit('@', 1)[1]}") != company.domain:
+        name_value = self._mapped_value(best_org, "company_name", ("name", "legalName", "alternateName")) if best_org else None
+        if not name_value:
+            og_site = soup.find("meta", property="og:site_name")
+            name_value = og_site.get("content", "").strip() if og_site and og_site.get("content") else None
+        if not name_value and soup.title and soup.title.string:
+            name_value = re.split(r"[|–—-]", soup.title.string)[0].strip()
+        name = str(name_value or page_domain.split(".")[0]).strip()
+
+        industry = self._mapped_value(best_org, "industry", ("industry", "knowsAbout", "genre")) if best_org else None
+        if isinstance(industry, list):
+            industry = " | ".join(map(str, industry))
+        size = self._mapped_value(best_org, "company_size", ("numberOfEmployees", "employees", "employeeCount")) if best_org else None
+        if isinstance(size, dict):
+            size = size.get("value") or size.get("minValue")
+
+        hq_phone = None
+        for link in soup.select('a[href^="tel:"]'):
+            candidate = self._normalise_phone(link.get("href", "")[4:].split("?", 1)[0])
+            if len(re.sub(r"\D", "", candidate)) >= 10:
+                hq_phone = candidate
+                break
+
+        linkedin_url, twitter_url = self._extract_socials(soup)
+
+        parsed = urlsplit(self.canonicalize_url(url))
+        return {
+            "domain": page_domain,
+            "name": name or None,
+            "website_url": urlunsplit((parsed.scheme, parsed.netloc, "/", "", "")),
+            "industry": self.clean_industry(str(industry)) if industry else None,
+            "company_size": self.clean_company_size(str(size)) if size else None,
+            "hq_phone": hq_phone,
+            "linkedin_url": linkedin_url,
+            "twitter_url": twitter_url,
+            "extra_metadata": self._json_ld_extra_metadata(best_org),
+        }
+
+    # ------------------------------------------------------------------
+    # Decision-maker discovery (person cards + email pattern candidates)
+    # ------------------------------------------------------------------
+    @classmethod
+    def _looks_like_person_name(cls, text: str) -> bool:
+        if not text or not 5 <= len(text) <= 40:
+            return False
+        tokens = text.split()
+        if not 2 <= len(tokens) <= 4:
+            return False
+        if TITLE_PATTERN.search(text):
+            return False
+        for token in tokens:
+            if not re.fullmatch(r"[A-Za-z][A-Za-z.'-]*", token):
+                return False
+            if token.lower().strip(".',-") in NAME_STOPWORDS:
+                return False
+        if not any(token[0].isupper() for token in tokens):
+            return False
+        parsed = HumanName(text)
+        return bool(parsed.first and parsed.last)
+
+    @staticmethod
+    def _email_candidates(first_name: str, last_name: str, domain: str) -> List[str]:
+        first = re.sub(r"[^a-z]", "", (first_name or "").lower())
+        last = re.sub(r"[^a-z]", "", (last_name or "").lower())
+        if not first or not last or not domain:
+            return []
+        return [
+            f"{first}.{last}@{domain}",
+            f"{first}{last}@{domain}",
+            f"{first[0]}{last}@{domain}",
+            f"{first}@{domain}",
+        ]
+
+    def _extract_persons(self, soup: BeautifulSoup, company_domain: str) -> List[PersonRecord]:
+        """Discover decision-makers from team/about page person cards."""
+        persons: List[PersonRecord] = []
+        seen_names = set()
+        for element in soup.find_all(["h2", "h3", "h4", "h5", "strong", "b"]):
+            name_text = element.get_text(" ", strip=True)
+            if not self._looks_like_person_name(name_text):
                 continue
-            text = self._visible_text(scope)
-            first_name, last_name = self._name_from_email(email)
-            leads.append(LeadCreateSchema(
-                first_name=first_name,
-                last_name=last_name,
-                title=self._title_from_text(text),
-                work_email=email,
-                phones=self._phones_in_element(scope),
-                linkedin_url=next(iter(self._linkedin_urls_in_element(scope, profile_only=True)), None),
+            parsed_name = HumanName(name_text)
+            dedupe_key = (parsed_name.first.lower(), parsed_name.last.lower())
+            if dedupe_key in seen_names:
+                continue
+            # Find the smallest ancestor card that carries this person's title.
+            card: Optional[Tag] = None
+            for ancestor in [element, *list(element.parents)[:4]]:
+                if not isinstance(ancestor, Tag):
+                    continue
+                card_text = self._visible_text(ancestor)
+                if 20 <= len(card_text) <= 400 and TITLE_PATTERN.search(card_text):
+                    card = ancestor
+                    break
+            if card is None:
+                continue
+            # Prefer the full title line inside the card ("VP of Engineering"),
+            # falling back to the bare keyword match.
+            title = None
+            for text_bit in card.find_all(string=True):
+                bit = " ".join(str(text_bit).split())
+                if not bit or bit == name_text or len(bit) > 60:
+                    continue
+                if TITLE_PATTERN.search(bit):
+                    title = bit
+                    break
+            if title is None:
+                title = self._title_from_text(self._visible_text(card).replace(name_text, " ", 1))
+            seen_names.add(dedupe_key)
+            persons.append(PersonRecord(
+                first_name=parsed_name.first.capitalize(),
+                last_name=parsed_name.last.capitalize(),
+                title=title,
+                seniority=self._seniority_from_title(title),
+                department=self._department_from_title(title),
+                linkedin_url=next(iter(self._linkedin_urls_in_element(card, profile_only=True)), None),
+                candidate_emails=self._email_candidates(parsed_name.first, parsed_name.last, company_domain),
             ))
-        return company, leads
+            if len(persons) >= MAX_PERSONS_PER_PAGE:
+                break
+        return persons
 
+    # ------------------------------------------------------------------
+    # Page-type routed parsing
+    # ------------------------------------------------------------------
+    def parse_page(self, html_content: str, url: str) -> ParsedPage:
+        page_type = self.classify_page(url)
+        soup = self._soup(html_content)
+
+        if page_type == PageType.DIRECTORY_LISTING:
+            return ParsedPage(page_type=page_type, profile_links=self.extract_profile_links(html_content, url))
+
+        if page_type == PageType.DIRECTORY_PROFILE:
+            company_info = self.extract_target_company_info(html_content, url)
+            company = CompanyCreateSchema(**company_info)
+            leads = self._extract_leads(soup, company.domain)
+            source_domain = self.extract_domain(url)
+            target_website = company.website_url if company.domain and company.domain != source_domain else None
+            return ParsedPage(page_type=page_type, company=company, leads=leads, target_website=target_website)
+
+        company_info = self._company_site_info(soup, url)
+        tech_map = self._detect_tech_map(html_content)
+        company = CompanyCreateSchema(
+            **company_info,
+            detected_technologies=list(tech_map),
+            tech_category_map=tech_map,
+        )
+        leads = self._extract_leads(soup, company.domain)
+        persons = self._extract_persons(soup, company.domain)
+        return ParsedPage(page_type=PageType.COMPANY_SITE, company=company, leads=leads, persons=persons)
+
+    def parse_html(self, html_content: str, url: str) -> Tuple[CompanyCreateSchema, List[LeadCreateSchema]]:
+        """Backwards-compatible wrapper returning (company, leads)."""
+        page = self.parse_page(html_content, url)
+        return page.company, page.leads
+
+    # ------------------------------------------------------------------
+    # Recursive crawl link extraction (company sites)
+    # ------------------------------------------------------------------
     def extract_internal_links(self, html_content: str, base_url: str, max_links: int = 10) -> List[str]:
         """Return unique crawlable same-host links, with high-value pages first."""
         domain = self.extract_domain(base_url)

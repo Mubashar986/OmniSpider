@@ -30,6 +30,21 @@ class Settings(BaseSettings):
     # DNS Servers for Email Verification (Issue #21)
     DNS_SERVERS: str = "8.8.8.8,1.1.1.1,9.9.9.9"
 
+    # SMTP RCPT-TO Verification Stage (SRS section 4, WBS 3.1)
+    SMTP_VERIFY_ENABLED: bool = True
+    SMTP_PORT: int = 25
+    SMTP_TIMEOUT: int = 10
+    SMTP_HELO_DOMAIN: str = "omnispider-validator.local"
+    SMTP_MAIL_FROM: str = "probe@omnispider-validator.local"
+
+    # Per-Domain Politeness (replaces proxy rotation)
+    PER_DOMAIN_MIN_INTERVAL: float = 3.0
+    PER_DOMAIN_JITTER: float = 3.0
+
+    # Phone Extraction & Tier-2 Engine
+    PHONE_DEFAULT_REGION: str = "US"
+    TIER2_HEADLESS: bool = True
+
     # Browser Fingerprint Pool (Issue #18)
     BROWSER_PROFILES: str = "chrome120,chrome124,chrome126"
 

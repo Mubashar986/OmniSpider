@@ -17,7 +17,7 @@ from app.core.database import SessionLocal
 from app.models.company import Company
 from app.models.lead import Lead
 
-def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: int = 0, enable_cooldown: bool = False):
+def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: int = 0, enable_cooldown: bool = True):
     print("=" * 70)
     print(" 🚀 UNBLOCKABLE MULTI-TIER LEAD GENERATION SCRAPER")
     print("=" * 70)
@@ -26,7 +26,7 @@ def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: in
     if force_tier:
         print(f"Forced Engine Tier:     {force_tier}")
     if enable_cooldown:
-        print(f"Cooldown Check:        Enabled (--cooldown)")
+        print(f"Cooldown Check:        Enabled (default; use --no-cooldown to disable)")
     else:
         print(f"Cooldown Check:        Disabled (Fresh Fetch Every Time)")
     print("-" * 70)
@@ -107,7 +107,7 @@ def main():
     parser.add_argument("--tier2", action="store_true", help="Force Tier 2 nodriver CDP engine")
     parser.add_argument("-r", "--recursive", action="store_true", help="Recursively scrape internal subpages (/about, /team, /contact)")
     parser.add_argument("-d", "--depth", type=int, default=0, help="Crawl depth (default 0, set 1 for immediate subpages)")
-    parser.add_argument("-c", "--cooldown", action="store_true", help="Enable 7-day scrape cooldown check (Disabled by default)")
+    parser.add_argument("--no-cooldown", action="store_true", help="Disable the 7-day re-scrape cooldown (enabled by default)")
 
     args = parser.parse_args()
 
@@ -125,7 +125,7 @@ def main():
     force_tier = "tier2" if args.tier2 else None
     crawl_depth = 1 if args.recursive and args.depth == 0 else args.depth
 
-    run_generic_scraper(target_urls, force_tier=force_tier, crawl_depth=crawl_depth, enable_cooldown=args.cooldown)
+    run_generic_scraper(target_urls, force_tier=force_tier, crawl_depth=crawl_depth, enable_cooldown=not args.no_cooldown)
 
 if __name__ == "__main__":
     main()

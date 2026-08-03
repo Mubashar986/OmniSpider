@@ -5,10 +5,13 @@ from app.models.company import Company
 from app.models.technology import CompanyTechnology
 from app.schemas.company import CompanyCreateSchema
 
+
 class CompanyRepository:
     """
     Repository for Company database operations, including atomic UPSERT
-    and technographic stack tracking.
+    and technographic stack tracking. Updates are non-destructive:
+    scalar fields coalesce, extra_metadata deep-merges at the top level,
+    and updated_at always advances on conflict.
     """
     def upsert_company(self, db: Session, schema: CompanyCreateSchema) -> Company:
         stmt = pg_insert(Company).values(
@@ -17,29 +20,39 @@ class CompanyRepository:
             website_url=schema.website_url,
             industry=schema.industry,
             company_size=schema.company_size,
-            extra_metadata=getattr(schema, "extra_metadata", {})
-        ).on_conflict_do_update(
+            hq_phone=schema.hq_phone,
+            linkedin_url=schema.linkedin_url,
+            twitter_url=schema.twitter_url,
+            extra_metadata=schema.extra_metadata or {},
+        )
+        excluded = stmt.excluded
+        stmt = stmt.on_conflict_do_update(
             index_elements=["domain"],
             set_={
-                "name": func.coalesce(schema.name, Company.name),
-                "website_url": func.coalesce(schema.website_url, Company.website_url),
-                "industry": func.coalesce(schema.industry, Company.industry),
-                "company_size": func.coalesce(schema.company_size, Company.company_size),
-                "extra_metadata": getattr(schema, "extra_metadata", {}) or Company.extra_metadata
+                "name": func.coalesce(excluded.name, Company.name),
+                "website_url": func.coalesce(excluded.website_url, Company.website_url),
+                "industry": func.coalesce(excluded.industry, Company.industry),
+                "company_size": func.coalesce(excluded.company_size, Company.company_size),
+                "hq_phone": func.coalesce(excluded.hq_phone, Company.hq_phone),
+                "linkedin_url": func.coalesce(excluded.linkedin_url, Company.linkedin_url),
+                "twitter_url": func.coalesce(excluded.twitter_url, Company.twitter_url),
+                # Top-level JSONB merge: newly scraped keys win, old keys survive.
+                "extra_metadata": func.coalesce(Company.extra_metadata, {}).op("||")(func.coalesce(excluded.extra_metadata, {})),
+                "updated_at": func.now(),
             }
         ).returning(Company)
-        
+
         company = db.execute(stmt).scalar_one()
-        
+
         # Save detected technographics with conflict guard (WBS 1.3)
         for tech_name in schema.detected_technologies:
             tech_stmt = pg_insert(CompanyTechnology).values(
                 company_id=company.id,
                 tech_name=tech_name,
-                category="Scraped Stack"
+                category=schema.tech_category_map.get(tech_name) or "Detected Stack",
             ).on_conflict_do_nothing(index_elements=["company_id", "tech_name"])
             db.execute(tech_stmt)
-            
+
         db.commit()
         db.refresh(company)
         return company
