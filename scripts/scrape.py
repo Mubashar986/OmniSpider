@@ -45,29 +45,48 @@ def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: in
 
         try:
             result = job.get(timeout=45)
-            status = result.get("status")
+            status = result.get("status", "unknown")
+            page_type = result.get("page_type", "N/A")
 
             print("\n   --- Scrape Task Result ---")
-            print(f"   Status:       {status.upper()}")
-            print(f"   Engine Used:  {result.get('engine_used', 'N/A')}")
-            print(f"   Domain:       {result.get('domain', 'N/A')}")
-            print(f"   Company:      {result.get('company_name', 'N/A')}")
-            print(f"   Leads Saved:  {result.get('leads_saved', 0)}")
-            print(f"   Tech Stack:   {result.get('detected_tech', [])}")
+            print(f"   Status:                 {status.upper()}")
+            print(f"   Page Classification:    {page_type.upper()}")
+            print(f"   Engine Used:            {result.get('engine_used', 'N/A')}")
+            print(f"   Domain:                 {result.get('domain', 'N/A')}")
 
-            subpages = result.get("dispatched_subpages", [])
-            if subpages:
-                print(f"\n   Dispatched Subpages ({len(subpages)}):")
-                for sub in subpages:
-                    print(f"      -> {sub}")
-                print("\n   ⏳ Waiting for Celery worker to process subpage tasks (10s delay)...")
-                import time
-                time.sleep(10)
+            # Directory Listing details
+            if page_type == "directory_listing":
+                profiles = result.get("dispatched_profiles", [])
+                links_found = result.get("profile_links_found", len(profiles))
+                print(f"   Profile Links Found:    {links_found}")
+                print(f"   Dispatched Profiles:    {len(profiles)}")
+                if profiles:
+                    print(f"\n   📋 Dispatched Company Profiles ({len(profiles)}):")
+                    for p_url in profiles:
+                        print(f"      -> {p_url}")
+                    print("\n   ⏳ Celery worker is processing company profile tasks in the background...")
+                elif links_found == 0:
+                    print("\n   ⚠️ No company profile links found on this page (URL path may be empty or invalid).")
+
+            # Company Site or Profile details
+            else:
+                print(f"   Company:                {result.get('company_name', 'N/A')}")
+                print(f"   Leads Saved:            {result.get('leads_saved', 0)}")
+                if result.get("inferred_leads"):
+                    print(f"   Inferred Decision-Makers: {result.get('inferred_leads')}")
+                print(f"   Tech Stack:             {result.get('detected_tech', [])}")
+
+                subpages = result.get("dispatched_subpages", [])
+                if subpages:
+                    print(f"\n   📑 Dispatched Subpages ({len(subpages)}):")
+                    for sub in subpages:
+                        print(f"      -> {sub}")
+                    print("\n   ⏳ Celery worker is processing subpage tasks in the background...")
 
             if status == "skipped":
-                print(f"   Reason:       {result.get('reason')}")
+                print(f"   Reason:                 {result.get('reason')}")
 
-            elif status in ("success", "failed"):
+            elif status in ("success", "failed") and page_type != "directory_listing":
                 db = SessionLocal()
                 try:
                     domain = result.get("domain")
@@ -91,9 +110,13 @@ def run_generic_scraper(urls: List[str], force_tier: str = None, crawl_depth: in
                 finally:
                     db.close()
             elif status == "error":
-                print(f"   Error Log:    {result.get('error')}")
+                print(f"   Error Log:              {result.get('error')}")
 
         except Exception as e:
+            try:
+                job.forget()
+            except Exception:
+                pass
             print(f"   Execution Error: {e}")
             print("   (Ensure Celery worker is running: python -m celery -A app.tasks.celery_app worker --pool=solo -l info)")
 

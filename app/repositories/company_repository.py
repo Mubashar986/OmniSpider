@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
+from sqlalchemy import cast, func
 from app.models.company import Company
 from app.models.technology import CompanyTechnology
 from app.schemas.company import CompanyCreateSchema
@@ -26,6 +26,7 @@ class CompanyRepository:
             extra_metadata=schema.extra_metadata or {},
         )
         excluded = stmt.excluded
+        empty_jsonb = cast("{}", JSONB)
         stmt = stmt.on_conflict_do_update(
             index_elements=["domain"],
             set_={
@@ -37,7 +38,9 @@ class CompanyRepository:
                 "linkedin_url": func.coalesce(excluded.linkedin_url, Company.linkedin_url),
                 "twitter_url": func.coalesce(excluded.twitter_url, Company.twitter_url),
                 # Top-level JSONB merge: newly scraped keys win, old keys survive.
-                "extra_metadata": func.coalesce(Company.extra_metadata, {}).op("||")(func.coalesce(excluded.extra_metadata, {})),
+                "extra_metadata": func.coalesce(Company.extra_metadata, empty_jsonb).op("||")(
+                    func.coalesce(excluded.extra_metadata, empty_jsonb)
+                ),
                 "updated_at": func.now(),
             }
         ).returning(Company)

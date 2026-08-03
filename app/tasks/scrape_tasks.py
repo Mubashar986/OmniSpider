@@ -178,9 +178,17 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
             error_message=scrape_result.error_message,
         )
 
+        if scrape_result.status_code == 404:
+            logger.warning(f"[Task {task_id}] URL returned 404 Not Found: {url}")
+            return {
+                "status": "failed", "reason": "404_not_found",
+                "engine_used": scrape_result.engine_used, "status_code": 404,
+                "session_id": session_id,
+            }
+
         if scrape_result.status_code != 200 or scrape_result.is_blocked:
             logger.error(f"[Task {task_id}] Scrape blocked/failed for {url}")
-            if not self.request.called_directly:
+            if not self.request.called_directly and (scrape_result.is_blocked or scrape_result.status_code in (403, 429, 503)):
                 try:
                     raise self.retry(countdown=BLOCK_BACKOFF_SECONDS * (self.request.retries + 1))
                 except MaxRetriesExceededError:
