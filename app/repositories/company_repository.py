@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy import cast, func
+from app.core.config import settings
 from app.models.company import Company
 from app.models.technology import CompanyTechnology
 from app.schemas.company import CompanyCreateSchema
@@ -14,6 +15,12 @@ class CompanyRepository:
     and updated_at always advances on conflict.
     """
     def upsert_company(self, db: Session, schema: CompanyCreateSchema) -> Company:
+        # Identity invariant (issue N1): a company row may never be keyed to a
+        # directory's own domain — that key would silently merge every unresolved
+        # profile on that directory into a single corrupt record.
+        domain = (schema.domain or "").lower()
+        if any(domain == d or domain.endswith(f".{d}") for d in settings.get_directory_domains()):
+            raise ValueError(f"Refusing to upsert company keyed to directory domain: {schema.domain!r}")
         stmt = pg_insert(Company).values(
             domain=schema.domain,
             name=schema.name,

@@ -21,6 +21,7 @@ __pycache__/
 .omx/
 logs/
 exports/
+scraped_html/
 test-monitor.log
 
 # Database Migrations & Alembic
@@ -29,11 +30,14 @@ test-monitor.log
 alembic/__pycache__/
 alembic/versions/__pycache__/
 
-# Skills & Agent Artifacts
+# Skills, Agent Artifacts & Planning Docs (NEVER COMMIT TO GIT)
 skills/
 .agents/
-.agents/artifacts/
-.agents/scratch/
+.agents/*
+COMPLETE_CODEBASE.md
+*_report.md
+*_discrepancy_report.md
+docs/master_wbs.md
 
 # IDE & Editor Settings
 .vscode/

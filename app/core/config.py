@@ -3,6 +3,11 @@ from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+from pathlib import Path
+
+ENV_FILE_PATH = Path(__file__).resolve().parents[2] / ".env"
+
+
 class Settings(BaseSettings):
     # Database
     POSTGRES_HOST: str = "localhost"
@@ -25,7 +30,9 @@ class Settings(BaseSettings):
     BLOCKLIST_PATTERNS: str = "cdn-cgi,wp-json,wp-admin,wp-includes,feed,xmlrpc.php,privacy,terms,advertise,get-listed,press-releases,blog,cookies,legal,sitemap,careers,faq"
 
     # Query Parameter Stripping (Issue #4)
-    IGNORED_QUERY_PARAMS: str = "utm_,fbclid,gclid,sort_by,location,project_cost,filter_by_service,page,verified,rating,review_sort,search"
+    # NOTE: "page" must NOT be ignored — stripping it canonicalizes ?page=2 to the
+    # page-1 URL and makes listing pagination unreachable (issue N4).
+    IGNORED_QUERY_PARAMS: str = "utm_,fbclid,gclid,sort_by,location,project_cost,filter_by_service,verified,rating,review_sort,search"
 
     # DNS Servers for Email Verification (Issue #21)
     DNS_SERVERS: str = "8.8.8.8,1.1.1.1,9.9.9.9"
@@ -49,7 +56,7 @@ class Settings(BaseSettings):
     BROWSER_PROFILES: str = "chrome120,chrome124,chrome126"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(ENV_FILE_PATH),
         env_file_encoding="utf-8",
         extra="ignore"
     )

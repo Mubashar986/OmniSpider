@@ -5,7 +5,7 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup
 
 from app.core.config import settings
-from app.services.scrapers.base import ScrapeResult
+from app.services.scrapers.base import ScrapeResult, detect_soft_404
 
 class Tier1HTTPScraper:
     """
@@ -75,13 +75,18 @@ class Tier1HTTPScraper:
                     except Exception:
                         pass
 
+            # Soft-404: 200 OK pages that are actually missing (issue: dead profiles
+            # persisted as real companies). Only checked on unblocked successes.
+            soft_404 = response.status_code == 200 and not is_blocked and detect_soft_404(html_text)
+
             return ScrapeResult(
                 url=url,
                 status_code=response.status_code,
                 headers=dict(response.headers),
                 html_content=response.text,
                 engine_used=f"curl_cffi:{target_impersonate}",
-                is_blocked=is_blocked
+                is_blocked=is_blocked,
+                extra_meta={"soft_404": True} if soft_404 else {},
             )
         except Exception as e:
             return ScrapeResult(

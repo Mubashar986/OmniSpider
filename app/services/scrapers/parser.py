@@ -140,6 +140,7 @@ class ParsedPage:
     company: Optional[CompanyCreateSchema] = None
     leads: List[LeadCreateSchema] = field(default_factory=list)
     profile_links: List[str] = field(default_factory=list)
+    pagination_links: List[str] = field(default_factory=list)
     target_website: Optional[str] = None
     persons: List[PersonRecord] = field(default_factory=list)
 
@@ -203,6 +204,14 @@ class HTMLParserService:
         parts = full_name.strip().split() if full_name else []
         return (parts[0], " ".join(parts[1:]) or None) if parts else (None, None)
 
+    @staticmethod
+    def _smart_case(name: str) -> str:
+        """Title-case only when the source lost casing; repair Mc/Mac prefixes (issue N12)."""
+        if not name:
+            return name
+        fixed = name.title() if (name.islower() or name.isupper()) else name
+        return re.sub(r"\bMc([a-z])", lambda match: "Mc" + match.group(1).upper(), fixed)
+
     # ------------------------------------------------------------------
     # Page classification & listing harvest (two-hop pipeline, WBS P0-B)
     # ------------------------------------------------------------------
@@ -253,6 +262,41 @@ class HTMLParserService:
                 found.add(clean_url)
         return sorted(found)[:max_links]
 
+    def extract_pagination_links(self, html_content: str, base_url: str, max_links: int = 2) -> List[str]:
+        """Harvest 'next page' links on directory listings (rel=next / Next-labelled).
+
+        Session-level dedup plus per-page chaining means each listing page dispatches
+        only its immediate successor, so coverage walks the full listing one page at
+        a time instead of stopping at page 1 (issue N4).
+        """
+        domain = self.extract_domain(base_url)
+        self_url = self.canonicalize_url(base_url)
+        found: Set[str] = set()
+        for a_tag in self._soup(html_content).find_all("a", href=True):
+            href = a_tag["href"].strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            rel = " ".join(a_tag.get("rel", [])).lower()
+            classes = " ".join(a_tag.get("class", [])).lower()
+            label = " ".join(filter(None, [a_tag.get_text(" ", strip=True), a_tag.get("aria-label"), a_tag.get("title")])).lower()
+            is_next = (
+                "next" in rel
+                or "next" in classes
+                or label in {"next", "next page", "next ›", "next »", "›", "»", "→"}
+                or label.startswith("next ")
+            )
+            if not is_next:
+                continue
+            full_url = urljoin(base_url, href)
+            if self.extract_domain(full_url) != domain:
+                continue
+            if BLOCKLIST_PATH_PATTERNS.search(urlsplit(full_url).path):
+                continue
+            clean_url = self.canonicalize_url(full_url)
+            if clean_url and clean_url != self_url:
+                found.add(clean_url)
+        return sorted(found)[:max_links]
+
     # ------------------------------------------------------------------
     # Soup & text helpers
     # ------------------------------------------------------------------
@@ -277,16 +321,41 @@ class HTMLParserService:
     # Email extraction
     # ------------------------------------------------------------------
     @staticmethod
+    def _is_public_suffix(label: str) -> bool:
+        """True when the label is itself nothing but a public suffix ('com', 'co.uk')."""
+        probe = tldextract.extract(label)
+        return bool(probe.suffix) and not probe.domain and not probe.subdomain
+
+    @staticmethod
     def _clean_email(value: str) -> Optional[str]:
         email = value.strip().lower().strip("<>[](){}.,;:'\"")
         if not EMAIL_REGEX.fullmatch(email):
             return None
         local_part, domain = email.rsplit("@", 1)
-        extracted = tldextract.extract(domain)
-        if not extracted.domain or not extracted.suffix:
+        candidate = domain.rstrip(".")
+
+        def _acceptable(host: str) -> Optional[str]:
+            extracted = tldextract.extract(host)
+            if extracted.suffix and extracted.domain and not HTMLParserService._is_public_suffix(extracted.domain):
+                return ".".join(part for part in (extracted.subdomain, extracted.domain, extracted.suffix) if part)
             return None
-        clean_domain = ".".join(part for part in (extracted.subdomain, extracted.domain, extracted.suffix) if part)
-        return f"{local_part}@{clean_domain}"
+
+        # Page text often fuses trailing words onto the TLD. Two trim passes:
+        # 1) segment-wise: "dotlogics.com.read" -> "dotlogics.com"
+        host = candidate
+        while host and "." in host:
+            cleaned = _acceptable(host)
+            if cleaned:
+                return f"{local_part}@{cleaned}"
+            host = host.rsplit(".", 1)[0]
+        # 2) char-wise for intra-segment fusion: "jploft.comphone" -> "jploft.com"
+        host = candidate
+        while host and "." in host:
+            cleaned = _acceptable(host)
+            if cleaned:
+                return f"{local_part}@{cleaned}"
+            host = host[:-1].rstrip(".")
+        return None
 
     @classmethod
     def is_business_email(cls, email: str) -> bool:
@@ -298,18 +367,43 @@ class HTMLParserService:
             return False
         return local_part not in {"you", "name", "email", "user", "example", "test"}
 
+    _AT_OBFUSCATION = re.compile(r"\s*(?:\[|\()\s*at\s*(?:\]|\))\s*", re.IGNORECASE)
+    _DOT_OBFUSCATION = re.compile(r"\s*(?:\[|\()\s*dot\s*(?:\]|\))\s*", re.IGNORECASE)
+
+    @staticmethod
+    def _decode_cfemail(encoded: str) -> Optional[str]:
+        """Decode a Cloudflare data-cfemail XOR-obfuscated address (issue N5)."""
+        try:
+            key = int(encoded[:2], 16)
+            decoded = "".join(chr(int(encoded[i:i + 2], 16) ^ key) for i in range(2, len(encoded), 2))
+            return decoded or None
+        except (ValueError, IndexError):
+            return None
+
+    @classmethod
+    def _deobfuscate_text(cls, text: str) -> str:
+        """Reveal 'name [at] domain [dot] com' style addresses when no plain @ exists."""
+        if not text or "@" in text:
+            return text or ""
+        text = cls._AT_OBFUSCATION.sub("@", text)
+        return cls._DOT_OBFUSCATION.sub(".", text) if "@" in text else text
+
     @classmethod
     def _emails_in_text(cls, text: str) -> Set[str]:
         return {
-            email for match in EMAIL_REGEX.findall(text or "")
+            email for match in EMAIL_REGEX.findall(cls._deobfuscate_text(text or ""))
             if (email := cls._clean_email(match)) and cls.is_business_email(email)
         }
 
     @classmethod
     def _emails_in_element(cls, element: Tag) -> Set[str]:
         emails = cls._emails_in_text(cls._visible_text(element))
-        for link in element.select('a[href^="mailto:"]'):
+        for link in element.find_all("a", href=lambda value: isinstance(value, str) and value.lower().startswith("mailto:")):
             emails.update(cls._emails_in_text(link.get("href", "")[7:].split("?", 1)[0]))
+        for protected in element.select("[data-cfemail]"):
+            decoded = cls._decode_cfemail(protected.get("data-cfemail", ""))
+            if decoded:
+                emails.update(cls._emails_in_text(decoded))
         return emails
 
     def extract_emails(self, html: str, domain: str = "") -> Set[str]:
@@ -338,8 +432,17 @@ class HTMLParserService:
 
     @classmethod
     def _phones_in_element(cls, element: Tag) -> List[PhoneSchema]:
-        candidates = PHONE_REGEX.findall(cls._visible_text(element))
-        candidates.extend(link.get("href", "")[4:].split("?", 1)[0] for link in element.select('a[href^="tel:"]'))
+        """Extract validated phone numbers via libphonenumber's matcher.
+
+        PhoneNumberMatcher handles international groupings the legacy NANP regex
+        missed (issue N6); tel: links remain an explicit high-trust source.
+        """
+        text = cls._visible_text(element)
+        candidates = [match.raw_string for match in phonenumbers.PhoneNumberMatcher(text, settings.PHONE_DEFAULT_REGION)]
+        candidates.extend(
+            link.get("href", "")[4:].split("?", 1)[0]
+            for link in element.find_all("a", href=lambda value: isinstance(value, str) and value.lower().startswith("tel:"))
+        )
         phones: List[PhoneSchema] = []
         seen = set()
         for candidate in candidates:
@@ -388,15 +491,75 @@ class HTMLParserService:
                 break
         return linkedin, twitter
 
+    @classmethod
+    def _socials_from_same_as(cls, best_org: Dict[str, object]) -> Tuple[Optional[str], Optional[str]]:
+        """Company socials from JSON-LD sameAs — covers JS-rendered footers Tier 1 never sees (issue A4)."""
+        linkedin = twitter = None
+        for url in cls._same_as_urls(best_org):
+            if linkedin is None:
+                match = LINKEDIN_REGEX.search(url)
+                if match and "/company/" in match.group(0).lower():
+                    linkedin = match.group(0).rstrip("/")
+            if twitter is None:
+                match = TWITTER_REGEX.search(url)
+                if match and match.group(1).lower() not in TWITTER_RESERVED_SLUGS:
+                    twitter = match.group(0).split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        return linkedin, twitter
+
+    @staticmethod
+    def _json_ld_telephone(best_org: Dict[str, object]) -> Optional[str]:
+        """HQ phone from schema.org contactPoint/telephone (issue A4)."""
+        if not best_org:
+            return None
+        candidates: List[object] = []
+        contact_points = best_org.get("contactPoint") or best_org.get("contactPoints")
+        if isinstance(contact_points, dict):
+            contact_points = [contact_points]
+        if isinstance(contact_points, list):
+            candidates.extend(point.get("telephone") for point in contact_points if isinstance(point, dict))
+        candidates.append(best_org.get("telephone"))
+        for candidate in candidates:
+            if candidate and len(re.sub(r"\D", "", str(candidate))) >= 10:
+                return str(candidate)
+        return None
+
     # ------------------------------------------------------------------
     # Technographics (categorized)
     # ------------------------------------------------------------------
     @staticmethod
-    def _detect_tech_map(html: str) -> Dict[str, str]:
+    def _tech_evidence(html: str) -> str:
+        """Structural evidence only: asset URLs, inline scripts, element markers.
+
+        Visible prose and anchor targets are excluded so a page merely *mentioning*
+        Tailwind/HubSpot in text or outbound links can no longer trigger a
+        technographic detection (issue N9).
+        """
+        soup = BeautifulSoup(html or "", "html.parser")
+        parts: List[str] = []
+        for tag in soup.find_all(True):
+            if tag.name == "a":
+                continue
+            parts.append(tag.name)
+            parts.extend(str(attribute) for attribute in tag.attrs.keys())
+            for attribute in ("src", "href", "content", "id", "name", "class"):
+                value = tag.get(attribute)
+                if isinstance(value, str):
+                    parts.append(value)
+                elif isinstance(value, (list, tuple)):
+                    parts.extend(str(item) for item in value)
+            if tag.name == "script":
+                inline = tag.string or tag.get_text()
+                if inline:
+                    parts.append(inline)
+        return "\n".join(parts)
+
+    @classmethod
+    def _detect_tech_map(cls, html: str) -> Dict[str, str]:
+        evidence = cls._tech_evidence(html)
         return {
             tech: TECH_CATEGORY_MAP.get(tech, "Detected Stack")
             for tech, patterns in TECH_SIGNATURES.items()
-            if any(re.search(pattern, html, re.IGNORECASE) for pattern in patterns)
+            if any(re.search(pattern, evidence, re.IGNORECASE) for pattern in patterns)
         }
 
     def detect_technologies(self, html: str) -> List[str]:
@@ -407,27 +570,73 @@ class HTMLParserService:
     # ------------------------------------------------------------------
     @classmethod
     def _contact_scope(cls, source: Tag) -> Tag:
-        """Find the closest meaningful card that does not contain many contacts."""
+        """Find the closest meaningful card, preferring single-contact scopes.
+
+        A scope holding exactly one email guarantees that titles, phones and socials
+        read from it belong to that contact (issue N7); multi-contact scopes are only
+        a fallback so the email itself is still captured.
+        """
         fallback = source.parent if source.parent and isinstance(source.parent, Tag) else source
-        for ancestor in [source, *source.parents]:
-            if not isinstance(ancestor, Tag) or ancestor.name not in CONTACT_SCOPE_TAGS:
-                continue
+        candidates = [
+            ancestor for ancestor in [source, *source.parents]
+            if isinstance(ancestor, Tag) and ancestor.name in CONTACT_SCOPE_TAGS
+        ]
+        for ancestor in candidates:
+            if len(cls._emails_in_element(ancestor)) == 1:
+                return ancestor
+        for ancestor in candidates:
             if len(cls._emails_in_element(ancestor)) <= 3:
                 return ancestor
         return fallback
+
+    # Role/department local-parts never identify a person.
+    ROLE_LOCAL_PARTS = {
+        "info", "contact", "sales", "support", "hello", "admin", "team", "office",
+        "mail", "enquiries", "enquiry", "careers", "jobs", "hr", "marketing", "press",
+        "media", "billing", "accounts", "legal", "privacy", "help", "service",
+        "services", "inquiry", "inquiries", "connect", "hi", "hey", "welcome",
+        "noreply", "no-reply",
+    }
+    # Single-token local-parts are only accepted as a person's name when the token is
+    # a known given name; otherwise guessing would fabricate data (issue N12).
+    COMMON_FIRST_NAMES = {
+        "james", "john", "robert", "michael", "david", "william", "richard", "joseph",
+        "thomas", "charles", "daniel", "matthew", "anthony", "mark", "paul", "steven",
+        "andrew", "joshua", "kevin", "brian", "george", "edward", "ryan", "jacob",
+        "nicholas", "eric", "jonathan", "justin", "brandon", "adam", "nathan", "peter",
+        "luke", "alex", "alexander", "ben", "benjamin", "sam", "samuel", "tom", "joe",
+        "chris", "christopher", "max", "leo", "henry", "jack", "oliver", "harry",
+        "charlie", "jake", "callum", "mary", "patricia", "jennifer", "linda",
+        "elizabeth", "barbara", "susan", "jessica", "sarah", "karen", "nancy", "lisa",
+        "margaret", "betty", "sandra", "ashley", "dorothy", "kimberly", "emily",
+        "michelle", "amanda", "stephanie", "carol", "laura", "rebecca", "sharon",
+        "anna", "emma", "olivia", "ava", "mia", "sophia", "isabella", "charlotte",
+        "amelia", "grace", "chloe", "zoe", "lily", "hannah", "ella", "scarlett",
+        "maria", "fatima", "aisha", "amina", "zainab", "priya", "anita", "pooja",
+        "rahul", "arjun", "raj", "vikram", "sanjay", "deepak", "amit", "rohit",
+        "ali", "ahmed", "omar", "hassan", "hussain", "muhammad", "usman", "bilal",
+        "hamza", "farhan", "imran", "sara", "carlos", "juan", "luis", "diego",
+        "sofia", "lucas", "mateo", "leon", "felix", "oscar", "hugo", "liam", "noah",
+        "ethan", "mason", "logan", "lucas", "mia", "evelyn", "harper",
+    }
 
     @staticmethod
     def _name_from_email(email: str) -> Tuple[Optional[str], Optional[str]]:
         local = email.split("@", 1)[0].split("+", 1)[0]
         local = re.sub(r"\d+$", "", local)
         tokens = [token for token in re.split(r"[._-]+", local) if token and token.isalpha()]
+        if not tokens or tokens[0].lower() in HTMLParserService.ROLE_LOCAL_PARTS:
+            return None, None
         if len(tokens) == 1:
             # A doubled boundary character is a common joined-name pattern: aminaameer -> Amina Ameer.
             joined = re.fullmatch(r"([a-z]{2,}?)([a-z])\2([a-z]{2,})", tokens[0].lower())
             if joined:
                 tokens = [joined.group(1) + joined.group(2), joined.group(2) + joined.group(3)]
-        if not tokens or tokens[0] in {"info", "contact", "sales", "support", "hello", "admin", "team"}:
-            return None, None
+            elif tokens[0].lower() in HTMLParserService.COMMON_FIRST_NAMES:
+                return tokens[0].capitalize(), None
+            else:
+                # A single unknown token ("johnsmith"): guessing would fabricate a name.
+                return None, None
         return HTMLParserService.split_full_name(" ".join(token.capitalize() for token in tokens))
 
     @staticmethod
@@ -470,20 +679,25 @@ class HTMLParserService:
     def _lead_records(self, soup: BeautifulSoup) -> Iterable[Tuple[str, Tag]]:
         """Yield each email once with its smallest useful DOM scope, in document order."""
         records: Dict[str, Tag] = {}
+
+        def _record(email: str, source: Tag) -> None:
+            scope = self._contact_scope(source)
+            previous = records.get(email)
+            if previous is None or len(scope.get_text(" ", strip=True)) < len(previous.get_text(" ", strip=True)):
+                records[email] = scope
+
         for node in soup.find_all(string=True):
             if not isinstance(node, NavigableString) or not node.parent or node.parent.name in {"script", "style", "template", "noscript"}:
                 continue
             for email in self._emails_in_text(str(node)):
-                scope = self._contact_scope(node.parent)
-                previous = records.get(email)
-                if previous is None or len(scope.get_text(" ", strip=True)) < len(previous.get_text(" ", strip=True)):
-                    records[email] = scope
-        for link in soup.select('a[href^="mailto:"]'):
+                _record(email, node.parent)
+        for link in soup.find_all("a", href=lambda value: isinstance(value, str) and value.lower().startswith("mailto:")):
             for email in self._emails_in_text(link.get("href", "")[7:].split("?", 1)[0]):
-                scope = self._contact_scope(link)
-                previous = records.get(email)
-                if previous is None or len(scope.get_text(" ", strip=True)) < len(previous.get_text(" ", strip=True)):
-                    records[email] = scope
+                _record(email, link)
+        for protected in soup.select("[data-cfemail]"):
+            decoded = self._decode_cfemail(protected.get("data-cfemail", ""))
+            for email in self._emails_in_text(decoded or ""):
+                _record(email, protected)
         return records.items()
 
     def _extract_leads(self, soup: BeautifulSoup, allowed_domain: str) -> List[LeadCreateSchema]:
@@ -525,6 +739,26 @@ class HTMLParserService:
         candidate_domain = HTMLParserService.extract_domain(candidate_url)
         return bool(candidate_domain and candidate_domain != page_domain and not candidate_domain.endswith(f".{page_domain}"))
 
+    @staticmethod
+    def _same_as_urls(record: Dict[str, object]) -> List[str]:
+        same_as = record.get("sameAs") if isinstance(record, dict) else None
+        urls = same_as if isinstance(same_as, list) else [same_as]
+        return [str(url) for url in urls if isinstance(url, str) and url.startswith(("http://", "https://"))]
+
+    def _website_from_same_as(self, best_org: Dict[str, object], page_domain: str) -> Optional[str]:
+        """Directory JSON-LD often lists the company site in sameAs alongside socials."""
+        for url in self._same_as_urls(best_org):
+            if not self._is_external(url, page_domain):
+                continue
+            candidate_domain = self.extract_domain(url)
+            if any(candidate_domain == blocked or candidate_domain.endswith(f".{blocked}") for blocked in SOCIAL_OR_UTILITY_DOMAINS):
+                continue
+            canonical = self.canonicalize_url(url)
+            if canonical:
+                parsed = urlsplit(canonical)
+                return urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+        return None
+
     def extract_target_website(self, soup: BeautifulSoup, page_url: str) -> Optional[str]:
         """Select a labelled external company site, never an arbitrary page-level link."""
         page_domain = self.extract_domain(page_url)
@@ -555,15 +789,52 @@ class HTMLParserService:
         parsed = urlsplit(best)
         return urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
 
+    _SIZE_RANGE = re.compile(r"(?<![\d.])(\d{1,7})\s*(?:[-–—]|to)\s*(\d{1,7})(?![\d.])")
+    _SIZE_PLUS = re.compile(r"(?<![\d.])(\d{1,7})\s*\+(?![\d.])")
+    _SIZE_INT = re.compile(r"(?<![\d.])(\d{1,7})(?![\d.])")
+    _SIZE_KEYWORD = re.compile(r"\b(?:employees?|staff|team|people|personnel|headcount|members?|size)\b", re.IGNORECASE)
+    _SIZE_JUNK = re.compile(
+        r"\b(?:services?|projects?|reviews?|clients?|years?|ratings?|portfolio|products?|apps?|"
+        r"awards?|countries|locations?|offices?|cases?|industries)\b|[%$€£]",
+        re.IGNORECASE,
+    )
+    _SIZE_BARE = re.compile(r"\d{1,7}(?:\s*(?:[-–—]|to)\s*\d{1,7}|\s*\+?)")
+    MAX_HEADCOUNT = 10_000_000
+
     @staticmethod
     def clean_company_size(value: Optional[str]) -> Optional[str]:
+        """Normalize an employee-count expression, or None when the value is not a size.
+
+        Accepted: label/keyword context ("Team size: 60+ employees"), and bare values
+        that are *entirely* a size expression ("10-49", "250", "60+") as produced by
+        JSON-LD numberOfEmployees or definition-list values. Rejected: numbers embedded
+        in unrelated prose ("Browse all 60+ services", "4.9 rating", "Founded 2012").
+        """
         if not value:
             return None
-        normalized = re.sub(r"\s+", " ", value).strip()
-        if not re.search(r"\b(?:employees?|staff|team|people|personnel)\b", normalized, re.IGNORECASE):
+        normalized = re.sub(r"\s+", " ", str(value)).strip()
+        if not normalized:
             return None
-        match = re.search(r"(?<!\d)(\d+\s*(?:[-–]|to)\s*\d+|\d+\s*\+?)(?!\d)", normalized)
-        return re.sub(r"\s+", "", match.group(1)).replace("–", "-") if match else None
+        has_keyword = bool(HTMLParserService._SIZE_KEYWORD.search(normalized))
+        is_bare = bool(HTMLParserService._SIZE_BARE.fullmatch(normalized))
+        if not has_keyword:
+            if not is_bare or HTMLParserService._SIZE_JUNK.search(normalized):
+                return None
+        range_match = HTMLParserService._SIZE_RANGE.search(normalized)
+        if range_match:
+            low, high = int(range_match.group(1)), int(range_match.group(2))
+            if 0 < low < high <= HTMLParserService.MAX_HEADCOUNT:
+                return f"{low}-{high}"
+            return None
+        plus_match = HTMLParserService._SIZE_PLUS.search(normalized)
+        if plus_match:
+            count = int(plus_match.group(1))
+            return f"{count}+" if 0 < count <= HTMLParserService.MAX_HEADCOUNT else None
+        int_match = HTMLParserService._SIZE_INT.search(normalized)
+        if int_match and (has_keyword or is_bare):
+            count = int(int_match.group(1))
+            return str(count) if 0 < count <= HTMLParserService.MAX_HEADCOUNT else None
+        return None
 
     @staticmethod
     def clean_industry(value: Optional[str]) -> Optional[str]:
@@ -577,12 +848,30 @@ class HTMLParserService:
 
     @classmethod
     def _labelled_value(cls, soup: BeautifulSoup, labels: Tuple[str, ...]) -> Optional[str]:
-        """Get compact, visible text around a field label without scanning page navigation."""
+        """Get the *value* attached to a field label, not the label's whole block.
+
+        Resolution order (issue N2): the compact text node itself when it carries
+        more than the bare label ("Company Size: 10-49"), then the value sibling
+        (dt→dd, th→td, label→span), and only then the old ancestor-text fallback.
+        """
         for node in soup.find_all(string=True):
-            if not node.parent or node.parent.name in {"script", "style", "template", "noscript"}:
+            if not node.parent or not node.parent.name in {"script", "style", "template", "noscript"}:
                 continue
-            if not any(label in node.strip().lower() for label in labels):
+            text = " ".join(str(node).split())
+            if not text:
                 continue
+            lowered = text.lower()
+            label_hit = next((label for label in labels if label in lowered), None)
+            if label_hit is None:
+                continue
+            remainder = lowered.replace(label_hit, "", 1).strip(" :|-–—•·")
+            if remainder and len(text) <= 120:
+                return text
+            sibling = node.parent.find_next_sibling()
+            if isinstance(sibling, Tag):
+                sibling_text = cls._visible_text(sibling)
+                if 0 < len(sibling_text) <= 200:
+                    return sibling_text
             for ancestor in [node.parent, *list(node.parents)[:3]]:
                 if not isinstance(ancestor, Tag):
                     continue
@@ -625,6 +914,25 @@ class HTMLParserService:
         return next((record[key] for key in keys if record.get(key)), None)
 
     @staticmethod
+    def _json_ld_size(value: Optional[object]) -> Optional[str]:
+        """Flatten schema.org numberOfEmployees shapes into a clean_company_size input."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return str(int(value))
+        if isinstance(value, dict):
+            low, high = value.get("minValue"), value.get("maxValue")
+            if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+                return f"{int(low)}-{int(high)}"
+            scalar = value.get("value") or low or high
+            return str(int(scalar)) if isinstance(scalar, (int, float)) else (str(scalar) if scalar else None)
+        if isinstance(value, list):
+            return next((flattened for item in value if (flattened := HTMLParserService._json_ld_size(item))), None)
+        return str(value)
+
+    @staticmethod
     def _json_ld_extra_metadata(best_org: Dict[str, object]) -> Dict[str, object]:
         """Long-tail company facts that have no dedicated column live in extra_metadata."""
         metadata: Dict[str, object] = {}
@@ -651,17 +959,23 @@ class HTMLParserService:
         external_website = self.extract_target_website(soup, page_url)
         orgs = self._json_ld_organizations(soup, page_domain)
         best_org = max(orgs, key=lambda item: item[0])[1] if orgs else {}
-        json_website_value = self._mapped_value(best_org, "website", ("url", "sameAs", "mainEntityOfPage")) if best_org else ""
+        # sameAs stays out of this tuple: it needs social-domain filtering, which
+        # _website_from_same_as applies below (taking the raw list would key the
+        # company to e.g. linkedin.com).
+        json_website_value = self._mapped_value(best_org, "website", ("url", "mainEntityOfPage")) if best_org else ""
         if isinstance(json_website_value, list):
             json_website_value = next((value for value in json_website_value if isinstance(value, str) and value.startswith(("http://", "https://"))), "")
         json_website = str(json_website_value or "")
         website = external_website or (self.canonicalize_url(json_website) if self._is_external(json_website, page_domain) else None)
+        if not website and best_org:
+            website = self._website_from_same_as(best_org, page_domain)
         if website:
             parsed = urlsplit(website)
             website = urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
-        else:
-            parsed = urlsplit(self.canonicalize_url(page_url))
-            website = urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+        # Fail-closed: when the target's own site cannot be resolved, website/domain
+        # stay None. Falling back to the directory page here would key the company row
+        # to the directory's domain and silently merge unrelated companies (issue N1).
+        return_domain = self.extract_domain(website) if website else None
 
         directory_profile = DIRECTORY_PROFILES.get(page_domain, {})
         name_selector = directory_profile.get("company_name_selector") if isinstance(directory_profile, dict) else None
@@ -675,17 +989,27 @@ class HTMLParserService:
         if isinstance(industry, list):
             industry = " | ".join(map(str, industry))
         industry = industry or profile_industry or self._labelled_value(soup, ("industry", "industry focus", "industries"))
-        size = self._mapped_value(best_org, "company_size", ("numberOfEmployees", "employees", "employeeCount")) if best_org else None
-        if isinstance(size, dict):
-            size = size.get("value") or size.get("minValue")
+        if not industry:
+            # Generic directory markup marks the industry by class ("industry-name",
+            # "category-industry"). Bounded: short text, no numeric junk.
+            for element in soup.select("[class*=industry]"):
+                text = element.get_text(" | ", strip=True)
+                if text and len(text) <= 120 and not self._SIZE_JUNK.search(text):
+                    industry = text
+                    break
+        size = self._json_ld_size(self._mapped_value(best_org, "company_size", ("numberOfEmployees", "employees", "employeeCount"))) if best_org else None
         size = size or self._labelled_value(soup, ("company size", "team size", "employees", "employee count"))
 
         # Socials scoped to the company-name block so directory footer socials never leak in.
         social_scope: Tag = h1.parent if h1 and isinstance(h1.parent, Tag) else soup
         linkedin_url, twitter_url = self._extract_socials(social_scope)
+        if not linkedin_url or not twitter_url:
+            ld_linkedin, ld_twitter = self._socials_from_same_as(best_org)
+            linkedin_url = linkedin_url or ld_linkedin
+            twitter_url = twitter_url or ld_twitter
 
         return {
-            "domain": self.extract_domain(website),
+            "domain": return_domain,
             "name": name or None,
             "website_url": website,
             "industry": self.clean_industry(str(industry)) if industry else None,
@@ -714,18 +1038,21 @@ class HTMLParserService:
         industry = self._mapped_value(best_org, "industry", ("industry", "knowsAbout", "genre")) if best_org else None
         if isinstance(industry, list):
             industry = " | ".join(map(str, industry))
-        size = self._mapped_value(best_org, "company_size", ("numberOfEmployees", "employees", "employeeCount")) if best_org else None
-        if isinstance(size, dict):
-            size = size.get("value") or size.get("minValue")
+        size = self._json_ld_size(self._mapped_value(best_org, "company_size", ("numberOfEmployees", "employees", "employeeCount"))) if best_org else None
 
         hq_phone = None
-        for link in soup.select('a[href^="tel:"]'):
+        for link in soup.find_all("a", href=lambda value: isinstance(value, str) and value.lower().startswith("tel:")):
             candidate = self._normalise_phone(link.get("href", "")[4:].split("?", 1)[0])
             if len(re.sub(r"\D", "", candidate)) >= 10:
                 hq_phone = candidate
                 break
+        hq_phone = hq_phone or self._json_ld_telephone(best_org)
 
         linkedin_url, twitter_url = self._extract_socials(soup)
+        if not linkedin_url or not twitter_url:
+            ld_linkedin, ld_twitter = self._socials_from_same_as(best_org)
+            linkedin_url = linkedin_url or ld_linkedin
+            twitter_url = twitter_url or ld_twitter
 
         parsed = urlsplit(self.canonicalize_url(url))
         return {
@@ -803,7 +1130,7 @@ class HTMLParserService:
             title = None
             for text_bit in card.find_all(string=True):
                 bit = " ".join(str(text_bit).split())
-                if not bit or bit == name_text or len(bit) > 60:
+                if not bit or bit == name_text or len(bit) > 100:
                     continue
                 if TITLE_PATTERN.search(bit):
                     title = bit
@@ -812,8 +1139,8 @@ class HTMLParserService:
                 title = self._title_from_text(self._visible_text(card).replace(name_text, " ", 1))
             seen_names.add(dedupe_key)
             persons.append(PersonRecord(
-                first_name=parsed_name.first.capitalize(),
-                last_name=parsed_name.last.capitalize(),
+                first_name=self._smart_case(parsed_name.first),
+                last_name=self._smart_case(parsed_name.last),
                 title=title,
                 seniority=self._seniority_from_title(title),
                 department=self._department_from_title(title),
@@ -832,10 +1159,20 @@ class HTMLParserService:
         soup = self._soup(html_content)
 
         if page_type == PageType.DIRECTORY_LISTING:
-            return ParsedPage(page_type=page_type, profile_links=self.extract_profile_links(html_content, url))
+            return ParsedPage(
+                page_type=page_type,
+                profile_links=self.extract_profile_links(html_content, url),
+                pagination_links=self.extract_pagination_links(html_content, url),
+            )
 
         if page_type == PageType.DIRECTORY_PROFILE:
             company_info = self.extract_target_company_info(html_content, url)
+            if not company_info.get("domain"):
+                # Fail-closed (issue N1): an unresolved target identity must never
+                # become a company row keyed to the directory's own domain, and the
+                # directory's own emails must never be saved as that "company's" leads.
+                logger.warning("Directory profile target website unresolved; nothing persisted: %s", url)
+                return ParsedPage(page_type=page_type)
             company = CompanyCreateSchema(**company_info)
             leads = self._extract_leads(soup, company.domain)
             source_domain = self.extract_domain(url)

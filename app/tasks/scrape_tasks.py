@@ -1,10 +1,13 @@
 import hashlib
 import logging
 import random
+import re
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from celery.exceptions import MaxRetriesExceededError, Retry
 
@@ -20,6 +23,29 @@ from app.services.scrapers.tier2_cdp import Tier2CDPScraper
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
+
+HTML_DUMP_DIR = Path(__file__).resolve().parents[2] / "scraped_html"
+
+
+def _save_html_dump(url: str, html_content: str) -> Optional[str]:
+    """Save raw fetched HTML to scraped_html/ directory for inspection."""
+    if not html_content:
+        return None
+    try:
+        HTML_DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        parsed = urlsplit(url if "://" in url else f"https://{url}")
+        domain_part = re.sub(r"[^a-zA-Z0-9_-]", "_", parsed.netloc or "page")
+        path_part = re.sub(r"[^a-zA-Z0-9_-]", "_", parsed.path.strip("/")) or "index"
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:6]
+        filename = f"{domain_part}_{path_part[:30]}_{url_hash}.html"
+        filepath = HTML_DUMP_DIR / filename
+        filepath.write_text(html_content, encoding="utf-8", errors="replace")
+        logger.info("Dumped raw HTML for %s to %s", url, filepath)
+        return str(filepath)
+    except Exception as dump_error:
+        logger.warning("Failed to dump HTML for %s: %s", url, dump_error)
+        return None
+
 
 # Initialize stateless services & repositories
 tier1_scraper = Tier1HTTPScraper()
@@ -156,6 +182,9 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
     task_id = self.request.id or "direct"
     session_id = session_id or str(uuid.uuid4())
     domain = parser_service.extract_domain(url)
+    # Cooldown and scrape-log identity use the canonical URL so cosmetic variants
+    # (trailing slash, tracking params, reordered query) share one key (issue N11).
+    canonical_url = parser_service.canonicalize_url(url) or url
     source_platform = source_platform or (domain if parser_service.classify_page(url) != PageType.COMPANY_SITE else "direct")
     logger.info(f"[Task {task_id}] [Session {session_id}] {url} (domain={domain}, depth={crawl_depth})")
 
@@ -163,7 +192,7 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
     try:
         # 1. Frequency control (default ON since the politeness pack)
         cooldown_days = settings.SCRAPE_COOLDOWN_DAYS
-        if enable_cooldown and not force_refresh and cooldown_days > 0 and scrape_log_repo.was_scraped_recently(db, url, days=cooldown_days):
+        if enable_cooldown and not force_refresh and cooldown_days > 0 and scrape_log_repo.was_scraped_recently(db, canonical_url, days=cooldown_days):
             logger.info(f"[Task {task_id}] '{url}' scraped within {cooldown_days}d. Skipping.")
             return {"status": "skipped", "reason": f"scraped_within_{cooldown_days}_days", "domain": domain, "url": url, "session_id": session_id}
 
@@ -173,16 +202,17 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
         scrape_result = _fetch_with_fallback(url, domain, force_tier)
 
         scrape_log_repo.log_scrape_attempt(
-            db=db, url=url, domain=domain,
+            db=db, url=canonical_url, domain=domain,
             status_code=scrape_result.status_code, engine_used=scrape_result.engine_used,
             error_message=scrape_result.error_message,
         )
 
-        if scrape_result.status_code == 404:
-            logger.warning(f"[Task {task_id}] URL returned 404 Not Found: {url}")
+        if scrape_result.status_code == 404 or scrape_result.extra_meta.get("soft_404"):
+            reason = "404_not_found" if scrape_result.status_code == 404 else "soft_404_detected"
+            logger.warning(f"[Task {task_id}] URL failed with {reason}: {url}")
             return {
-                "status": "failed", "reason": "404_not_found",
-                "engine_used": scrape_result.engine_used, "status_code": 404,
+                "status": "failed", "reason": reason,
+                "engine_used": scrape_result.engine_used, "status_code": scrape_result.status_code,
                 "session_id": session_id,
             }
 
@@ -199,8 +229,9 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
                 "session_id": session_id,
             }
 
-        # 3. Route by page type
+        # 3. Save raw HTML dump & route by page type
         self.update_state(state="PROGRESS", meta={"step": "parsing", "url": url, "session_id": session_id})
+        html_dump_path = _save_html_dump(url, scrape_result.html_content)
         page = parser_service.parse_page(scrape_result.html_content, url)
 
         # -- DIRECTORY LISTING: only harvest & dispatch profile pages ----------------
@@ -213,14 +244,32 @@ def scrape_url_task(self, url: str, force_tier: Optional[str] = None, crawl_dept
                     crawl_depth=0, enable_cooldown=enable_cooldown, force_refresh=force_refresh,
                     max_links=max_links, source_platform=source_platform,
                 )
-            logger.info(f"[Task {task_id}] Listing page: dispatched {len(fresh_profiles)} profile pages.")
+            # Follow listing pagination so multi-page directories get harvested (issue N4).
+            fresh_pages = _session_claim(page.pagination_links, session_id)
+            for next_page_url in fresh_pages:
+                _dispatch_child(
+                    next_page_url, session_id=session_id, force_tier=force_tier,
+                    crawl_depth=0, enable_cooldown=enable_cooldown, force_refresh=force_refresh,
+                    max_links=max_links, source_platform=source_platform,
+                )
+            logger.info(f"[Task {task_id}] Listing page: dispatched {len(fresh_profiles)} profile pages, {len(fresh_pages)} pagination pages.")
             return {
                 "status": "success", "page_type": page.page_type, "domain": domain,
                 "session_id": session_id, "engine_used": scrape_result.engine_used,
                 "profile_links_found": len(page.profile_links), "dispatched_profiles": fresh_profiles,
+                "dispatched_pagination": fresh_pages,
             }
 
         # -- DIRECTORY PROFILE & COMPANY SITE both upsert the real company ----------
+        if page.company is None:
+            # Fail-closed parsing (issue N1): the directory profile's target website
+            # could not be resolved, so there is no trustworthy identity to persist.
+            logger.warning(f"[Task {task_id}] Company identity unresolved for {url}; nothing persisted.")
+            return {
+                "status": "incomplete", "reason": "company_identity_unresolved",
+                "page_type": page.page_type, "domain": domain,
+                "session_id": session_id, "engine_used": scrape_result.engine_used,
+            }
         company = company_repo.upsert_company(db, page.company)
         logger.info(f"[Task {task_id}] Saved Company: {company.name} ({company.domain})")
 

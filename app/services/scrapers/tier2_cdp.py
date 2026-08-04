@@ -3,9 +3,18 @@ import logging
 import sys
 from typing import Optional, Dict, Any
 import nodriver as uc
-from app.services.scrapers.base import ScrapeResult
+from app.services.scrapers.base import ScrapeResult, detect_soft_404
 
 logger = logging.getLogger(__name__)
+
+
+def _quiet_loop_exception_handler(loop, context):
+    """Silence nodriver/WebSocket noise raised while the loop is closing."""
+    exception = context.get("exception")
+    message = str(context.get("message", ""))
+    if "loop is closed" in f"{message} {exception}".lower():
+        return
+    loop.default_exception_handler(context)
 
 class Tier2CDPScraper:
     """
@@ -68,7 +77,8 @@ class Tier2CDPScraper:
                 ("403 Forbidden" in html_content and "cloudflare" in html_content.lower())
             )
             error_msg = "Cloudflare Turnstile or WAF challenge unresolved" if is_blocked else None
-            
+            soft_404 = not is_blocked and detect_soft_404(html_content)
+
             return ScrapeResult(
                 url=url,
                 status_code=200 if not is_blocked else 403,
@@ -76,7 +86,8 @@ class Tier2CDPScraper:
                 html_content=html_content,
                 engine_used="nodriver",
                 is_blocked=is_blocked,
-                error_message=error_msg
+                error_message=error_msg,
+                extra_meta={"soft_404": True} if soft_404 else {},
             )
         except Exception as e:
             import traceback
@@ -106,4 +117,16 @@ class Tier2CDPScraper:
 
     def fetch_page(self, url: str, timeout: int = 30) -> ScrapeResult:
         """Synchronous wrapper for Celery task compatibility."""
-        return asyncio.run(self.fetch_page_async(url, timeout=timeout))
+        # Dedicated loop with a quiet exception handler: nodriver's WebSocket
+        # transport fires callbacks during teardown that otherwise log noisy
+        # "Event loop is closed" errors on the default asyncio.run() loop.
+        loop = asyncio.new_event_loop()
+        loop.set_exception_handler(_quiet_loop_exception_handler)
+        try:
+            return loop.run_until_complete(self.fetch_page_async(url, timeout=timeout))
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()

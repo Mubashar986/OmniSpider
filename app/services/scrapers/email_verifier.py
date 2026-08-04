@@ -27,6 +27,7 @@ MX_CACHE_TTL_SECONDS = 24 * 60 * 60
 CATCH_ALL_CACHE_TTL_SECONDS = 24 * 60 * 60
 SMTP_DOWN_RETRY_SECONDS = 60 * 60
 SHARED_CACHE_RETRY_SECONDS = 60
+MAX_CONCURRENT_VERIFICATIONS = 10
 
 STATUS_VERIFIED = "verified"
 STATUS_CATCH_ALL = "catch_all"
@@ -269,7 +270,9 @@ class EmailVerifierService:
 
     async def verify_email_async(self, email: str) -> EmailVerificationResult:
         email_clean = email.strip() if email else ""
-        terminal, domain, mx_records = self._preflight(email_clean)
+        # _preflight does blocking DNS/Redis I/O; run it in a thread so concurrent
+        # batch verification is not serialized behind the event loop (issue N8).
+        terminal, domain, mx_records = await asyncio.to_thread(self._preflight, email_clean)
         if terminal is not None:
             return terminal
 
@@ -293,23 +296,31 @@ class EmailVerifierService:
         return asyncio.run(self.verify_email_async(email))
 
     def verify_emails(self, emails: List[str]) -> Dict[str, EmailVerificationResult]:
-        """Batch verification on one event loop; MX/catch-all caches dedupe per domain."""
+        """
+        Batch verification with bounded concurrency (issue N8): SMTP probing is
+        latency-bound, so emails are probed in parallel under a semaphore while
+        MX/catch-all caches dedupe per domain. Order and crash-guards preserved.
+        """
         unique = list(dict.fromkeys(e for e in emails if e))
         if not unique:
             return {}
 
-        async def _run() -> Dict[str, EmailVerificationResult]:
-            results: Dict[str, EmailVerificationResult] = {}
-            for email in unique:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_VERIFICATIONS)
+
+        async def _verify_one(email: str) -> EmailVerificationResult:
+            async with semaphore:
                 try:
-                    results[email] = await self.verify_email_async(email)
+                    return await self.verify_email_async(email)
                 except Exception as exc:
                     logger.debug("Verification crashed for %s: %s", email, exc)
-                    results[email] = EmailVerificationResult(
+                    return EmailVerificationResult(
                         email=email, domain="", is_valid_syntax=False, has_mx_records=False,
                         is_disposable=False, is_deliverable=False, status=STATUS_UNVERIFIED,
                         error_message=str(exc),
                     )
-            return results
+
+        async def _run() -> Dict[str, EmailVerificationResult]:
+            results = await asyncio.gather(*(_verify_one(email) for email in unique))
+            return dict(zip(unique, results))
 
         return asyncio.run(_run())

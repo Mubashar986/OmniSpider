@@ -51,7 +51,7 @@ def test_target_company_identity_extraction():
     assert company.domain == "openxcell.com", f"Expected target domain 'openxcell.com', got '{company.domain}'"
     assert company.domain != "clutch.co", "CRITICAL BUG: Company domain is still being set to directory domain 'clutch.co'!"
     assert company.name == "OpenXcell", f"Expected target company name 'OpenXcell', got '{company.name}'"
-    assert company.website_url == "https://www.openxcell.com", f"Expected target website URL, got '{company.website_url}'"
+    assert company.website_url == "https://www.openxcell.com/", f"Expected target website URL, got '{company.website_url}'"
     
     # Assertions for Issue 2.3 (Firmographics)
     assert company.industry == "Custom Software Development", f"Expected industry 'Custom Software Development', got '{company.industry}'"
